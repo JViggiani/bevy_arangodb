@@ -1,13 +1,12 @@
-/// Note: Components and resources you wish to persist **must** derive
-/// `serde::Serialize` and `serde::Deserialize`.
-mod arango_session;
-mod arango_query;
-mod arango_connection;
-mod guid;
-mod persist;
-pub mod bevy_plugin;
-pub mod query_dsl;
+// modules
+pub mod components;
+pub mod db;
+pub mod plugins;
+pub mod query;
+pub mod resources;
 pub mod registration;
+
+mod persist;
 
 #[doc(hidden)]
 pub mod prelude {
@@ -18,9 +17,22 @@ pub mod prelude {
 #[doc(hidden)]
 pub use once_cell;
 
-pub use arango_session::{ArangoSession, DatabaseConnection, ArangoError, commit_app as commit, TransactionOperation};
-pub use arango_query::ArangoQuery;
-pub use arango_connection::{ArangoDbConnection, Collection};
-pub use guid::Guid;
+// Public API
+pub use plugins::persistence_plugin;
+
+pub use components::Guid;
+pub use db::{
+    DatabaseConnection,
+    ArangoDbConnection,
+    Collection,
+    ArangoError,
+    TransactionOperation,
+};
+pub use db::MockDatabaseConnection;
+pub use plugins::{
+    CommitStatus, PersistencePluginCore, TriggerCommit, CommitCompleted,
+    persistence_plugin::PersistenceSystemSet,
+};
+pub use query::{PersistenceQuery, dsl};
+pub use resources::{ArangoSession, commit_and_wait as commit};
 pub use persist::Persist;
-pub use bevy_plugin::ArangoPlugin;

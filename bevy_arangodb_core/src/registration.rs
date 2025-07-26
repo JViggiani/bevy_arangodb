@@ -1,16 +1,16 @@
-//! A thread-safe, runtime mechanism for component registration.
+//! A global registry for `Persist`-able types, populated at program startup.
 //!
-//! This avoids the pitfalls of link-time static collection by using a `once_cell`
-//! global to store registration functions. The `Persist` derive macro pushes
-//! functions into this registry, and the `ArangoPlugin` consumes them.
+//! The `persist` macro generates a `#[ctor]` static constructor for each
+//! decorated type. This constructor adds a registration function to the
+//! `COMPONENT_REGISTRY`. When the `PersistencePluginCore` is initialized, it
+//! drains this registry, calling each function to set up the necessary
+//! systems and serializers for each type.
 
 use bevy::app::App;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 
-/// A type alias for a function that can register a component with a Bevy App.
-pub type RegistrationFn = fn(&mut App);
+type RegistrationFn = fn(&mut App);
 
-/// The global, thread-safe registry for component registration functions.
 pub static COMPONENT_REGISTRY: Lazy<Mutex<Vec<RegistrationFn>>> =
     Lazy::new(|| Mutex::new(Vec::new()));

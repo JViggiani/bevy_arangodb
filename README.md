@@ -1,8 +1,8 @@
 # bevy_arangodb
 
 A Bevy plugin that bridges in-memory ECS with ArangoDB persistence.  
-Define persisted components/resources with the `#[persist(...)]` macro, add the `ArangoPlugin`,  
-call `commit(&mut app).await` to save changes, and use `ArangoQuery` to load data back.
+Define persisted components/resources with the `#[persist(...)]` macro, add the `PersistencePluginCore`,  
+call `commit(&mut app).await` to save changes, and use `PersistenceQuery` to load data back.
 
 ## Features
 
@@ -35,7 +35,7 @@ call `commit(&mut app).await` to save changes, and use `ArangoQuery` to load dat
 
     ```rust
     use bevy::prelude::*;
-    use bevy_arangodb::{ArangoPlugin, ArangoDbConnection, commit};
+    use bevy_arangodb::{PersistencePluginCore, ArangoDbConnection, commit};
 
     #[tokio::main]
     async fn main() {
@@ -49,7 +49,7 @@ call `commit(&mut app).await` to save changes, and use `ArangoQuery` to load dat
         // 2) Build Bevy app with plugin
         let mut app = App::new();
         app.add_plugins(DefaultPlugins);
-        app.add_plugins(ArangoPlugin::new(db.clone()));
+        app.add_plugins(PersistencePluginCore::new(db.clone()));
 
         // 3) Spawn entities or insert resources
         app.world.spawn(Health { value: 42 });
@@ -66,14 +66,14 @@ call `commit(&mut app).await` to save changes, and use `ArangoQuery` to load dat
 3. Query persisted data:
 
     ```rust
-    use bevy_arangodb::{ArangoQuery, commit};
+    use bevy_arangodb::{PersistenceQuery, commit};
 
     async fn load_data(db: Arc<dyn DatabaseConnection>) {
         let mut app = App::new();
-        app.add_plugins(ArangoPlugin::new(db.clone()));
+        app.add_plugins(PersistencePluginCore::new(db.clone()));
 
         // Only fetch Health > 10, also load Position if present
-        let entities = ArangoQuery::new(db.clone())
+        let entities = PersistenceQuery::new(db.clone())
             .with::<Position>()
             .filter(Health::value().gt(10))
             .fetch_into(&mut app)

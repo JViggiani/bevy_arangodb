@@ -29,7 +29,7 @@ impl<'de> Deserialize<'de> for Guid {
 
 impl Guid {
     /// Creates a new `Guid`. This is intended for modification in the internal library, but is available to read externally.
-    pub(crate) fn new(id: String) -> Self {
+    pub fn new(id: String) -> Self {
         Self(id)
     }
 

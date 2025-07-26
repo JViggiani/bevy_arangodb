@@ -7,17 +7,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use serde_json::Value;
-use crate::{DatabaseConnection, Guid, Collection, Persist, query_dsl};
-use bevy::prelude::{Component, World, App};
+use crate::{DatabaseConnection, Guid, Persist, ArangoSession};
+use crate::Collection;
+use crate::dsl::{Expression, translate_expression};
+use bevy::prelude::{Component, World};
 
 /// AQL query builder: select which components and filters to apply.
-pub struct ArangoQuery {
+pub struct PersistenceQuery {
     db: Arc<dyn DatabaseConnection>,
     pub component_names: Vec<&'static str>,
-    filter_expr: Option<query_dsl::Expression>,
+    filter_expr: Option<Expression>,
 }
 
-impl ArangoQuery {
+impl PersistenceQuery {
     /// Start a new query backed by a shared database connection.
     pub fn new(db: Arc<dyn DatabaseConnection>) -> Self {
         Self {
@@ -33,18 +35,17 @@ impl ArangoQuery {
         self
     }
 
-    /// Sets the filter for the query using a `query_dsl::Expression`.
-    pub fn filter(mut self, expression: query_dsl::Expression) -> Self {
+    /// Sets the filter for the query using a `dsl::Expression`.
+    pub fn filter(mut self, expression: Expression) -> Self {
         // Collect any component names referenced in the filter expression
-        fn collect(expr: &query_dsl::Expression, names: &mut Vec<&'static str>) {
-            use query_dsl::Expression::*;
+        fn collect(expr: &Expression, names: &mut Vec<&'static str>) {
             match expr {
-                Field { component_name, .. } => {
+                Expression::Field { component_name, .. } => {
                     if !names.contains(component_name) {
                         names.push(component_name);
                     }
                 }
-                BinaryOp { lhs, rhs, .. } => {
+                Expression::BinaryOp { lhs, rhs, .. } => {
                     collect(lhs, names);
                     collect(rhs, names);
                 }
@@ -77,7 +78,7 @@ impl ArangoQuery {
         }
 
         if let Some(expr) = &self.filter_expr {
-            filters.push(query_dsl::translate_expression(expr, &mut bind_vars));
+            filters.push(translate_expression(expr, &mut bind_vars));
         }
 
         if filters.is_empty() {
@@ -99,29 +100,25 @@ impl ArangoQuery {
         result
     }
 
-    /// Load matching entities into the `App`'s `World`.
+    /// Load matching entities into the World.
     ///
     /// Removes the `ArangoSession` resource, performs the database
     /// operations, and then re-inserts it.
-    pub async fn fetch_into(&self, app: &mut App) -> Vec<bevy::prelude::Entity> {
+    pub async fn fetch_into(&self, world: &mut World) -> Vec<bevy::prelude::Entity> {
         // remove the session resource
-        let session = app.world.remove_resource::<crate::ArangoSession>().unwrap();
-
-        // SAFETY: With the session removed, it's safe to get a mutable World reference
-        let world_ptr: *mut World = &mut app.world as *mut World;
-        let world = unsafe { &mut *world_ptr };
+        let session = world.remove_resource::<ArangoSession>().unwrap();
 
         // 1) run AQL to get matching keys
         let keys = self.fetch_ids().await;
         let mut result = Vec::new();
 
-        // 2) build map of existing entities by Guid
+        // 2) map existing guid→entity
         let mut existing = std::collections::HashMap::new();
         for (e, guid) in world.query::<(bevy::prelude::Entity, &Guid)>().iter(world) {
             existing.insert(guid.id().to_string(), e);
         }
 
-        // 3) for each key: spawn or reuse, then fetch & insert components
+        // 3) spawn or reuse + insert components
         for key in keys {
             let e = if let Some(&e) = existing.get(&key) {
                 e
@@ -130,23 +127,21 @@ impl ArangoQuery {
                 existing.insert(key.clone(), new_e);
                 new_e
             };
-            // Attempt to load each requested component; panic on error
             session
                 .fetch_and_insert_components(&*self.db, world, &key, e, &self.component_names)
                 .await
                 .expect("component deserialization failed");
-
             result.push(e);
         }
 
-        // 4) Fetch all persisted resources back into the world
+        // 4) insert resources
         session
             .fetch_and_insert_resources(&*self.db, world)
             .await
             .expect("resource deserialization failed");
 
-        // 5) restore the session and return
-        app.world.insert_resource(session);
+        // 5) restore and return
+        world.insert_resource(session);
         result
     }
 }
@@ -154,8 +149,8 @@ impl ArangoQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arango_session::MockDatabaseConnection;
-    use crate::{ArangoSession, DatabaseConnection, Persist, ArangoPlugin};
+    use crate::db::connection::MockDatabaseConnection;
+    use crate::{Persist, persistence_plugin::PersistencePluginCore};
     use bevy_arangodb_derive::persist;
     use bevy::prelude::App;
     use serde_json::json;
@@ -171,7 +166,7 @@ mod tests {
     #[test]
     fn build_query_with_dsl() {
         let db = Arc::new(MockDatabaseConnection::new());
-        let q = ArangoQuery::new(db.clone())
+        let q = PersistenceQuery::new(db.clone())
             .with::<A>()
             .filter(
                 A::value().gt(10)
@@ -200,7 +195,7 @@ mod tests {
     #[persist(component)]
     struct Health { value: i32 }
     #[persist(component)]
-    struct Position { x: f32, y: f32, z: f32 }
+    struct Position { x: f32, y: f32 }
 
     #[tokio::test]
     async fn fetch_into_loads_new_entities() {
@@ -212,7 +207,7 @@ mod tests {
             .returning(|_, _| Box::pin(async { Ok(Some(json!({"value":10}))) }));
         mock_db.expect_fetch_component()
             .withf(|k, comp| (k=="k1"||k=="k2") && comp==Position::name())
-            .returning(|_, _| Box::pin(async { Ok(Some(json!({"x":1.0,"y":2.0,"z":3.0}))) }));
+            .returning(|_, _| Box::pin(async { Ok(Some(json!({"x":1.0,"y":2.0}))) }));
         // Due to test pollution from other modules, other resource types might be registered.
         // We must expect `fetch_resource` to be called, and we can just return `None`.
         mock_db.expect_fetch_resource()
@@ -222,23 +217,23 @@ mod tests {
 
         // build app + session
         let mut app = App::new();
-        app.add_plugins(ArangoPlugin::new(db.clone()));
-        let mut session = app.world.resource_mut::<ArangoSession>();
+        app.add_plugins(PersistencePluginCore::new(db.clone()));
+        let mut session = app.world_mut().resource_mut::<ArangoSession>();
         session.register_component::<Health>();
         session.register_component::<Position>();
 
-        let query = ArangoQuery::new(db)
+        let query = PersistenceQuery::new(db)
             .with::<Health>()
             .with::<Position>();
 
-        let loaded = block_on(query.fetch_into(&mut app));
+        let loaded = query.fetch_into(app.world_mut()).await;
         assert_eq!(loaded.len(), 2);
     }
 
     #[test]
     fn build_query_empty_filters() {
         let db = Arc::new(MockDatabaseConnection::new());
-        let (aql, _) = ArangoQuery::new(db).build_aql();
+        let (aql, _) = PersistenceQuery::new(db).build_aql();
         assert!(aql.contains("FILTER true"));
     }
 
@@ -250,7 +245,7 @@ mod tests {
             .expect_query()
             .returning(|_, _| Box::pin(async { Err(crate::ArangoError("db error".into())) }));
         let db = Arc::new(mock_db);
-        let query = ArangoQuery::new(db);
+        let query = PersistenceQuery::new(db);
         block_on(query.fetch_ids());
     }
 
@@ -263,10 +258,10 @@ mod tests {
     #[test]
     fn build_query_single_and_multi() {
         let db = Arc::new(MockDatabaseConnection::new());
-        let (a_single, _) = ArangoQuery::new(db.clone()).with::<H>().build_aql();
+        let (a_single, _) = PersistenceQuery::new(db.clone()).with::<H>().build_aql();
         assert!(a_single.contains(&format!("doc.`{}` != null", H::name())));
 
-        let (a_multi, _) = ArangoQuery::new(db)
+        let (a_multi, _) = PersistenceQuery::new(db)
             .with::<H>()
             .with::<P>()
             .build_aql();

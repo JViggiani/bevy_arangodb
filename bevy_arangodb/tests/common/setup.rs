@@ -14,6 +14,14 @@ static DB_CONNECTION: OnceCell<Arc<dyn DatabaseConnection>> = OnceCell::const_ne
 // A mutex to ensure that tests run serially, not in parallel.
 pub static DB_LOCK: Mutex<()> = Mutex::const_new(());
 
+/// This function will be executed once when the test binary starts.
+#[ctor::ctor]
+fn initialize_logging() {
+    // The `try_init` call will fail if the logger is already set, which is fine.
+    // This ensures that logging is initialized exactly once.
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+}
+
 /// This function will be executed when the test program exits.
 #[ctor::dtor]
 fn teardown() {

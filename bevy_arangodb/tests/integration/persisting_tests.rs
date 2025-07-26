@@ -1,5 +1,5 @@
-use bevy::app::App;
-use bevy_arangodb::{commit, Guid, ArangoPlugin, Persist};
+use bevy::prelude::App;
+use bevy_arangodb::{commit, Guid, Persist, PersistencePlugins};
 
 use crate::common::*;
 
@@ -7,22 +7,23 @@ use crate::common::*;
 async fn test_create_new_entity() {
     let _guard = DB_LOCK.lock().await;
     let db = setup().await;
-
     let mut app = App::new();
-    app.add_plugins(ArangoPlugin::new(db.clone()));
+    app.add_plugins(PersistencePlugins(db.clone()));
 
     let health_val = Health { value: 100 };
     let pos_val = Position { x: 1.0, y: 2.0 };
 
-    let entity_id = app.world.spawn((health_val, pos_val)).id();
-    
+    let entity_id = app.world_mut().spawn((health_val, pos_val)).id();
+
     app.update(); // Run the schedule to trigger change detection
 
     commit(&mut app).await.unwrap();
 
     // 4. Verify the results
     // The entity should now have a Guid component assigned by the library.
-    let guid = app.world.get::<Guid>(entity_id)
+    let guid = app
+        .world()
+        .get::<Guid>(entity_id)
         .expect("Entity should have a Guid after commit");
 
     assert!(!guid.id().is_empty(), "Guid should not be empty");
@@ -48,11 +49,10 @@ async fn test_create_new_entity() {
 async fn test_create_new_resource() {
     let _guard = DB_LOCK.lock().await;
     let db = setup().await;
+    let mut app = App::new();
+    app.add_plugins(PersistencePlugins(db.clone()));
 
     // 1. Create a session, add a resource, and commit it
-    let mut app = App::new();
-    app.add_plugins(ArangoPlugin::new(db.clone()));
-
     let settings = GameSettings {
         difficulty: 0.8,
         map_name: "level_1".into(),
@@ -61,7 +61,7 @@ async fn test_create_new_resource() {
 
     app.update(); // Run the schedule to trigger change detection
 
-    commit(&mut app).await.expect("Commit failed");
+    commit(&mut app).await.unwrap();
 
     // 2. Verify the resource was saved correctly by fetching it directly
     let resource_name = GameSettings::name();
@@ -82,17 +82,21 @@ async fn test_create_new_resource() {
 async fn test_update_existing_entity() {
     let _guard = DB_LOCK.lock().await;
     let db = setup().await;
-
     let mut app = App::new();
-    app.add_plugins(ArangoPlugin::new(db.clone()));
+    app.add_plugins(PersistencePlugins(db.clone()));
 
     // 1. GIVEN a committed entity with a Health component of value 100
-    let entity_id = app.world.spawn(Health { value: 100 }).id();
+    let entity_id = app.world_mut().spawn(Health { value: 100 }).id();
     app.update();
-    commit(&mut app).await.expect("Initial commit failed");
+    commit(&mut app).await.unwrap();
 
     // Get the Guid to use for direct DB verification later
-    let guid = app.world.get::<Guid>(entity_id).unwrap().id().to_string();
+    let guid = app
+        .world()
+        .get::<Guid>(entity_id)
+        .unwrap()
+        .id()
+        .to_string();
 
     // Verify initial state in DB
     let health_json_before = db
@@ -104,13 +108,16 @@ async fn test_update_existing_entity() {
     assert_eq!(fetched_health_before.value, 100);
 
     // 2. WHEN the entity's Health value is changed to 50
-    let mut health = app.world.get_mut::<Health>(entity_id).unwrap();
+    let mut health = app
+        .world_mut()
+        .get_mut::<Health>(entity_id)
+        .unwrap();
     health.value = 50;
 
     app.update(); // This will mark the component as Changed
 
     // 3. AND the app is committed again
-    commit(&mut app).await.expect("Second commit failed");
+    commit(&mut app).await.unwrap();
 
     // 4. THEN the Health data in the database for that entity's Guid reflects the new value of 50.
     let health_json_after = db
@@ -132,9 +139,8 @@ async fn test_update_existing_entity() {
 async fn test_update_existing_resource() {
     let _guard = DB_LOCK.lock().await;
     let db = setup().await;
-
     let mut app = App::new();
-    app.add_plugins(ArangoPlugin::new(db.clone()));
+    app.add_plugins(PersistencePlugins(db.clone()));
 
     // 1. GIVEN a committed GameSettings resource
     let initial_settings = GameSettings {
@@ -143,17 +149,17 @@ async fn test_update_existing_resource() {
     };
     app.insert_resource(initial_settings);
     app.update(); // Run schedule to trigger change detection
-    commit(&mut app).await.expect("Initial commit failed");
+    commit(&mut app).await.unwrap();
 
     // 2. WHEN the GameSettings resource is modified in the app
-    let mut settings = app.world.resource_mut::<GameSettings>();
+    let mut settings = app.world_mut().resource_mut::<GameSettings>();
     settings.difficulty = 0.5;
     settings.map_name = "level_2".into();
 
     app.update(); // Run schedule to trigger change detection on the resource
 
     // 3. AND the app is committed again
-    commit(&mut app).await.expect("Second commit failed");
+    commit(&mut app).await.unwrap();
 
     // 4. THEN the GameSettings data in the database reflects the new values.
     let resource_name = GameSettings::name();
@@ -174,19 +180,23 @@ async fn test_update_existing_resource() {
 async fn test_delete_persisted_entity() {
     let _guard = DB_LOCK.lock().await;
     let db = setup().await;
-
     let mut app = App::new();
-    app.add_plugins(ArangoPlugin::new(db.clone()));
+    app.add_plugins(PersistencePlugins(db.clone()));
 
     // 1. Spawn and commit an entity.
-    let entity_id = app.world.spawn(Health { value: 100 }).id();
-    
+    let entity_id = app.world_mut().spawn(Health { value: 100 }).id();
+
     app.update();
 
-    commit(&mut app).await.expect("Commit failed");
+    commit(&mut app).await.unwrap();
 
     // 2. Verify it exists in the database.
-    let guid = app.world.get::<Guid>(entity_id).unwrap().id().to_string();
+    let guid = app
+        .world()
+        .get::<Guid>(entity_id)
+        .unwrap()
+        .id()
+        .to_string();
     let component = db
         .fetch_component(&guid, Health::name())
         .await
@@ -195,9 +205,9 @@ async fn test_delete_persisted_entity() {
     assert_eq!(component.get("value").unwrap().as_i64().unwrap(), 100);
 
     // 3. Despawn the entity and commit again.
-    app.world.entity_mut(entity_id).despawn();
+    app.world_mut().entity_mut(entity_id).despawn();
     app.update(); // This runs the despawn command and our auto-despawn-tracking system
-    commit(&mut app).await.expect("Second commit failed");
+    commit(&mut app).await.unwrap();
 
     // 4. Verify it's gone from the database.
     let component_after_delete = db
@@ -215,61 +225,85 @@ async fn test_delete_persisted_entity() {
 async fn test_commit_with_no_changes() {
     let _guard = DB_LOCK.lock().await;
     let db = setup().await;
-
     let mut app = App::new();
-    app.add_plugins(ArangoPlugin::new(db.clone()));
+    app.add_plugins(PersistencePlugins(db.clone()));
 
     // GIVEN a committed app in a synchronized state with the database
-    app.world.spawn(Health { value: 100 });
+    app.world_mut().spawn(Health { value: 100 });
     app.update();
-    commit(&mut app).await.expect("Initial commit should succeed");
+    commit(&mut app).await.unwrap();
 
     // WHEN the app is committed again with no changes made to any entities or resources
-    let result = commit(&mut app).await;
+    commit(&mut app).await.unwrap();
 
     // THEN the commit operation succeeds without error
     // AND no database write operations are performed (this is handled by an early return in the commit function)
-    assert!(
-        result.is_ok(),
-        "Commit with no changes should succeed without error"
-    );
+    let status = app.world().resource::<bevy_arangodb::CommitStatus>();
+    assert_eq!(*status, bevy_arangodb::CommitStatus::Idle);
 }
 
 #[tokio::test]
 async fn test_add_new_component_to_existing_entity() {
     let _guard = DB_LOCK.lock().await;
     let db = setup().await;
-
     let mut app = App::new();
-    app.add_plugins(ArangoPlugin::new(db.clone()));
+    app.add_plugins(PersistencePlugins(db.clone()));
 
     // 1. GIVEN a committed entity with only a Health component
-    let entity_id = app.world.spawn(Health { value: 100 }).id();
+    let entity_id = app.world_mut().spawn(Health { value: 100 }).id();
     app.update();
-    commit(&mut app).await.expect("Initial commit failed");
+    commit(&mut app).await.unwrap();
 
-    let guid = app.world.get::<Guid>(entity_id).unwrap().id().to_string();
+    let guid = app
+        .world()
+        .get::<Guid>(entity_id)
+        .unwrap()
+        .id()
+        .to_string();
 
     // Verify initial state: Health exists, Position does not.
-    let health_before = db.fetch_component(&guid, Health::name()).await.unwrap();
-    assert!(health_before.is_some(), "Health should exist after first commit");
-    let position_before = db.fetch_component(&guid, Position::name()).await.unwrap();
-    assert!(position_before.is_none(), "Position should not exist after first commit");
+    let health_before = db
+        .fetch_component(&guid, Health::name())
+        .await
+        .unwrap();
+    assert!(
+        health_before.is_some(),
+        "Health should exist after first commit"
+    );
+    let position_before = db
+        .fetch_component(&guid, Position::name())
+        .await
+        .unwrap();
+    assert!(
+        position_before.is_none(),
+        "Position should not exist after first commit"
+    );
 
     // 2. WHEN a Position component is added to that entity
-    app.world.entity_mut(entity_id).insert(Position { x: 10.0, y: 20.0 });
+    app
+        .world_mut()
+        .entity_mut(entity_id)
+        .insert(Position { x: 10.0, y: 20.0 });
     app.update(); // This will mark the entity as dirty due to the added component
 
     // 3. AND the app is committed again
-    commit(&mut app).await.expect("Second commit failed");
+    commit(&mut app).await.unwrap();
 
     // 4. THEN the document in the database is updated to include the new Position data
     //    while retaining the existing Health data.
-    let health_after_json = db.fetch_component(&guid, Health::name()).await.unwrap().unwrap();
+    let health_after_json = db
+        .fetch_component(&guid, Health::name())
+        .await
+        .unwrap()
+        .unwrap();
     let health_after: Health = serde_json::from_value(health_after_json).unwrap();
     assert_eq!(health_after.value, 100, "Health data was not retained");
 
-    let position_after_json = db.fetch_component(&guid, Position::name()).await.unwrap().unwrap();
+    let position_after_json = db
+        .fetch_component(&guid, Position::name())
+        .await
+        .unwrap()
+        .unwrap();
     let position_after: Position = serde_json::from_value(position_after_json).unwrap();
     assert_eq!(position_after.x, 10.0, "Position.x was not added correctly");
     assert_eq!(position_after.y, 20.0, "Position.y was not added correctly");
@@ -283,27 +317,26 @@ struct NonPersisted {
 
 #[tokio::test]
 async fn test_commit_entity_with_non_persisted_component() {
-    // GIVEN a new Bevy app with the ArangoPlugin
+    // GIVEN a new Bevy app with the PersistencePluginCore
     let _guard = DB_LOCK.lock().await;
     let db = setup().await;
-
     let mut app = App::new();
-    app.add_plugins(ArangoPlugin::new(db.clone()));
+    app.add_plugins(PersistencePlugins(db.clone()));
 
     // WHEN an entity is spawned with a mix of persisted and non-persisted components
     let entity_id = app
-        .world
+        .world_mut()
         .spawn((Health { value: 50 }, NonPersisted { _ignored: true }))
         .id();
 
     app.update();
 
     // AND the app is committed
-    commit(&mut app).await.expect("Commit should succeed");
+    commit(&mut app).await.unwrap();
 
     // THEN a document is created, but it only contains the persisted component's data.
     let guid = app
-        .world
+        .world()
         .get::<Guid>(entity_id)
         .expect("Entity should get a Guid because it has a persisted component")
         .id();
@@ -318,10 +351,7 @@ async fn test_commit_entity_with_non_persisted_component() {
     let obj = doc.as_object().unwrap();
 
     // Filter out ArangoDB metadata fields before checking the component count.
-    let component_fields: Vec<_> = obj
-        .keys()
-        .filter(|k| !k.starts_with('_'))
-        .collect();
+    let component_fields: Vec<_> = obj.keys().filter(|k| !k.starts_with('_')).collect();
 
     // It should have exactly one key: the name of the Health component.
     assert_eq!(
@@ -344,26 +374,25 @@ async fn test_commit_entity_with_non_persisted_component() {
 
 #[tokio::test]
 async fn test_persist_component_with_empty_vec() {
-    // GIVEN a new Bevy app with the ArangoPlugin
+    // GIVEN a new Bevy app with the PersistencePluginCore
     let _guard = DB_LOCK.lock().await;
     let db = setup().await;
-
     let mut app = App::new();
-    app.add_plugins(ArangoPlugin::new(db.clone()));
+    app.add_plugins(PersistencePlugins(db.clone()));
 
     // WHEN an entity is spawned with a component that contains an empty `Vec`
     let inventory = Inventory { items: vec![] };
-    let entity_id = app.world.spawn(inventory).id();
+    let entity_id = app.world_mut().spawn(inventory).id();
 
     app.update();
 
     // AND the app is committed
-    commit(&mut app).await.expect("Commit should succeed");
+    commit(&mut app).await.unwrap();
 
     // THEN the commit succeeds and the data can be fetched and correctly deserialized
     // back into a component with an empty `Vec`.
     let guid = app
-        .world
+        .world()
         .get::<Guid>(entity_id)
         .expect("Entity should have a Guid after commit")
         .id();
@@ -385,25 +414,24 @@ async fn test_persist_component_with_empty_vec() {
 
 #[tokio::test]
 async fn test_persist_component_with_option_none() {
-    // GIVEN a new Bevy app with the ArangoPlugin
+    // GIVEN a new Bevy app with the PersistencePlugin
     let _guard = DB_LOCK.lock().await;
     let db = setup().await;
-
     let mut app = App::new();
-    app.add_plugins(ArangoPlugin::new(db.clone()));
+    app.add_plugins(PersistencePlugins(db.clone()));
 
     // WHEN an entity is spawned with a component that has an `Option<T>` field set to `None`
     let optional_data = OptionalData { data: None };
-    let entity_id = app.world.spawn(optional_data).id();
+    let entity_id = app.world_mut().spawn(optional_data).id();
 
     app.update();
 
     // AND the app is committed
-    commit(&mut app).await.expect("Commit should succeed");
+    commit(&mut app).await.unwrap();
 
     // THEN the commit succeeds and the data can be fetched and correctly deserialized.
     let guid = app
-        .world
+        .world()
         .get::<Guid>(entity_id)
         .expect("Entity should have a Guid after commit")
         .id();

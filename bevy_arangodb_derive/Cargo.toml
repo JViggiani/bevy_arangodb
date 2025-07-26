@@ -12,3 +12,4 @@ quote = { workspace = true }
 proc-macro2 = { workspace = true }
 proc-macro-crate = "3.3.0"
 ctor.workspace = true
+bevy_reflect = "0.16.1"
