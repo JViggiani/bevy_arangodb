@@ -6,6 +6,7 @@
 use crate::registration::COMPONENT_REGISTRY;
 use crate::resources::persistence_session::_prepare_commit;
 use crate::{PersistenceError, PersistenceSession, DatabaseConnection, Guid, Persist};
+use crate::versioning::version_manager::VersionKey;
 use bevy::app::PluginGroupBuilder;
 use bevy::prelude::*;
 use bevy::tasks::{IoTaskPool, Task};
@@ -109,130 +110,145 @@ fn handle_commit_trigger(world: &mut World) {
         return;
     }
 
-    // --- STAGE 1: Prepare Data on Main Thread ---
-    let commit_data = {
-        let session = world.resource::<PersistenceSession>();
-        match _prepare_commit(session, world) {
-            Ok(data) => {
-                if data.operations.is_empty() {
-                    // If there are no operations, we still need to send a completion event
-                    // to unblock any waiting `commit_and_wait` calls.
-                    world.send_event(CommitCompleted(Ok(vec![]), vec![], correlation_id));
-                    return;
-                }
-                data
-            }
-            Err(e) => {
-                error!("Failed to prepare commit: {}", e);
-                world.send_event(CommitCompleted(Err(e), vec![], correlation_id));
-                return;
-            }
+    // 1) isolate dirty sets from the session
+    let (dirty_entities, despawned_entities, dirty_resources) = {
+        let mut session = world.resource_mut::<PersistenceSession>();
+        (
+            std::mem::take(&mut session.dirty_entities),
+            std::mem::take(&mut session.despawned_entities),
+            std::mem::take(&mut session.dirty_resources),
+        )
+    };
+
+    // 2) prepare commit with those sets
+    let commit_data = match _prepare_commit(
+        world.resource::<PersistenceSession>(),
+        world,
+        &dirty_entities,
+        &despawned_entities,
+        &dirty_resources,
+    ) {
+        Ok(data) if data.operations.is_empty() => {
+            // nothing to do → send completion and restore dirty sets
+            world.send_event(CommitCompleted(Ok(vec![]), vec![], correlation_id));
+            let mut session = world.resource_mut::<PersistenceSession>();
+            session.dirty_entities.extend(dirty_entities);
+            session.despawned_entities.extend(despawned_entities);
+            session.dirty_resources.extend(dirty_resources);
+            return;
+        }
+        Ok(data) => data,
+        Err(e) => {
+            // prepare failed → send error and restore dirty sets
+            world.send_event(CommitCompleted(Err(e.clone()), vec![], correlation_id));
+            let mut session = world.resource_mut::<PersistenceSession>();
+            session.dirty_entities.extend(dirty_entities);
+            session.despawned_entities.extend(despawned_entities);
+            session.dirty_resources.extend(dirty_resources);
+            return;
         }
     };
 
-    // Update status and spawn the task
+    // 3) spawn the async task
     *world.resource_mut::<CommitStatus>() = CommitStatus::InProgress;
-    info!("[handle_commit_trigger] CommitStatus set to InProgress. Spawning task.");
-
-    // Get the dedicated runtime
     let runtime = world.resource::<TokioRuntime>().0.clone();
-
     let thread_pool = IoTaskPool::get();
     let db = world.resource::<PersistenceSession>().db.clone();
     let new_entities = commit_data.new_entities;
     let operations = commit_data.operations;
-
     let task = thread_pool.spawn(async move {
-        // Use `block_on` to run the async database logic on the dedicated Tokio runtime.
-        // This blocks the current thread (from Bevy's pool), but that's okay here.
         runtime.block_on(async {
-            match db.execute_transaction(operations).await {
-                Ok(keys) => Ok((keys, new_entities)),
-                Err(e) => Err(e),
-            }
+            db.execute_transaction(operations).await
+                .map(|keys| (keys, new_entities))
         })
     });
 
-    // Spawn a new entity to hold the task and the correlation ID.
-    world.spawn((CommitTask(task), TriggerID(correlation_id)));
+    // 4) attach CommitTask + TriggerID + CommitMeta
+    world.spawn((
+        CommitTask(task),
+        TriggerID(correlation_id),
+        CommitMeta { dirty_entities, despawned_entities, dirty_resources },
+    ));
 }
 
 /// A component to correlate a commit task with its trigger event.
 #[derive(Component)]
 struct TriggerID(Option<u64>);
 
+/// Carries exactly the dirty‐sets for one in‐flight commit.
+#[derive(Component)]
+struct CommitMeta {
+    dirty_entities: HashSet<Entity>,
+    despawned_entities: HashSet<Entity>,
+    dirty_resources: HashSet<TypeId>,
+}
+
 /// A system that polls the running commit task and updates the state machine upon completion.
 fn handle_commit_completed(
     mut commands: Commands,
-    mut tasks: Query<(Entity, &mut CommitTask, &TriggerID)>,
+    mut query: Query<(Entity, &mut CommitTask, &TriggerID, &CommitMeta)>,
     mut session: ResMut<PersistenceSession>,
     mut status: ResMut<CommitStatus>,
-    mut completed_events: EventWriter<CommitCompleted>,
-    mut trigger_events: EventWriter<TriggerCommit>,
+    mut completed: EventWriter<CommitCompleted>,
+    mut triggers: EventWriter<TriggerCommit>,
 ) {
-    for (task_entity, mut task, trigger_id) in &mut tasks {
-        trace!("[handle_commit_completed] Polling a commit task for correlation ID {:?}.", trigger_id.0);
+    for (ent, mut task, trigger_id, meta) in &mut query {
         if let Some(result) = future::block_on(future::poll_once(&mut task.0)) {
-            debug!("[handle_commit_completed] Task is finished for correlation ID {:?}. Processing result.", trigger_id.0);
-            let event_result;
-
-            match result {
+            let cid = trigger_id.0;
+            let event_res = match result {
                 Ok((new_keys, new_entities)) => {
-                    info!(
-                        "Commit successful for correlation ID {:?}. Assigning {} new keys.",
-                        trigger_id.0,
-                        new_keys.len()
-                    );
-                    // Assign new GUIDs to newly created entities
-                    for (entity, key) in new_entities.iter().zip(new_keys.iter()) {
-                        commands.entity(*entity).insert(Guid::new(key.clone()));
-                        session.entity_keys.insert(*entity, key.clone());
-                        // Cache the initial version for the new entity.
-                        session.entity_versions.insert(*entity, 1);
+                    // assign GUIDs + initial versions
+                    for (e, key) in new_entities.iter().zip(new_keys.iter()) {
+                        commands.entity(*e).insert(Guid::new(key.clone()));
+                        session.entity_keys.insert(*e, key.clone());
+                        session.version_manager.set_version(VersionKey::Entity(key.clone()), 1);
                     }
-
-                    // Update versions for all dirtied resources
-                    let dirty_resources_clone = session.dirty_resources.clone();
-                    for type_id in dirty_resources_clone.iter() {
-                        let current_version = session.resource_versions.entry(*type_id).or_insert(0);
-                        *current_version += 1;
+                    // bump resource versions
+                    for tid in &meta.dirty_resources {
+                        let vk = VersionKey::Resource(*tid);
+                        let nv = session.version_manager.get_version(&vk).unwrap_or(0) + 1;
+                        session.version_manager.set_version(vk, nv);
                     }
-
-                    // Only clear the dirty flags if we are not immediately starting another commit.
-                    if *status != CommitStatus::InProgressAndDirty {
-                        session.dirty_entities.clear();
-                        session.despawned_entities.clear();
-                        session.dirty_resources.clear();
-                        debug!("Commit successful, returning to Idle.");
+                    // bump existing-entity versions
+                    let new_set: HashSet<_> = new_entities.iter().cloned().collect();
+                    let keys_to_update: Vec<_> = meta.dirty_entities
+                        .iter()
+                        .filter(|e| !new_set.contains(e))
+                        .filter_map(|e| session.entity_keys.get(e).cloned())
+                        .collect();
+                    for key in keys_to_update {
+                        let vk = VersionKey::Entity(key.clone());
+                        if let Some(v) = session.version_manager.get_version(&vk) {
+                            session.version_manager.set_version(vk, v + 1);
+                        }
                     }
-
-                    event_result = Ok(new_keys);
+                    // remove versions for deleted entities
+                    for e in &meta.despawned_entities {
+                        if let Some(key) = session.entity_keys.get(e).cloned() {
+                            session.version_manager.remove_version(&VersionKey::Entity(key));
+                        }
+                    }
+                    Ok(new_keys)
                 }
-                Err(e) => {
-                    error!(
-                        "Commit failed for correlation ID {:?}: {}",
-                        trigger_id.0, e
-                    );
-                    event_result = Err(e);
+                Err(err) => {
+                    // restore dirty sets on failure
+                    session.dirty_entities.extend(meta.dirty_entities.clone());
+                    session.despawned_entities.extend(meta.despawned_entities.clone());
+                    session.dirty_resources.extend(meta.dirty_resources.clone());
+                    Err(err)
                 }
-            }
-            // The task is complete, so we can despawn the task entity.
-            commands.entity(task_entity).despawn();
-
-            // Check if another commit was requested while this one was running.
+            };
+            // cleanup
+            commands.entity(ent).despawn();
+            // possibly chain a queued commit
             if *status == CommitStatus::InProgressAndDirty {
-                info!("Commit completed, but world is dirty. Triggering another commit.");
-                // Set status back to Idle and immediately trigger a new commit.
-                // The `handle_commit_trigger` system will run in the same tick.
                 *status = CommitStatus::Idle;
-                trigger_events.write(TriggerCommit::default());
+                triggers.write(TriggerCommit::default());
             } else {
-                // Otherwise, we are done.
                 *status = CommitStatus::Idle;
             }
-
-            // Send the completion event for any waiting `commit_and_wait` calls.
-            completed_events.write(CommitCompleted(event_result, vec![], trigger_id.0));
+            // notify commit_and_wait
+            completed.write(CommitCompleted(event_res, vec![], cid));
         }
     }
 }

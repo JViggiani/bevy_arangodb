@@ -117,10 +117,7 @@ pub fn persist(attr: TokenStream, item: TokenStream) -> TokenStream {
     let impl_persist = quote! {
         impl #crate_path::Persist for #name {
             fn name() -> &'static str {
-                // The name needs to be stable and unique. Using the type_name is a good default.
-                // We replace `::` with `-` to be safe for collection names.
-                static NAME: &str = stringify!(#name);
-                NAME
+                stringify!(#name)
             }
         }
     };
@@ -157,12 +154,26 @@ pub fn persist(attr: TokenStream, item: TokenStream) -> TokenStream {
 fn get_crate_path() -> proc_macro2::TokenStream {
     use proc_macro_crate::{crate_name, FoundCrate};
 
+    // First check if we're in the bevy_arangodb crate (integration tests)
+    if let Ok(FoundCrate::Itself) = crate_name("bevy_arangodb") {
+        return quote!(::bevy_arangodb::bevy_arangodb_core);
+    }
+
+    // Then check for bevy_arangodb_core
     match crate_name("bevy_arangodb_core") {
         Ok(FoundCrate::Itself) => quote!(crate),
         Ok(FoundCrate::Name(name)) => {
             let ident = syn::Ident::new(&name, proc_macro2::Span::call_site());
             quote!(::#ident)
         }
-        Err(_) => quote!(::bevy_arangodb_core), // Fallback for cases like docs.rs
+        Err(_) => {
+            // Try to find bevy_arangodb as a dependency
+            if let Ok(FoundCrate::Name(name)) = crate_name("bevy_arangodb") {
+                let ident = syn::Ident::new(&name, proc_macro2::Span::call_site());
+                quote!(::#ident::bevy_arangodb_core)
+            } else {
+                quote!(::bevy_arangodb_core)
+            }
+        }
     }
 }

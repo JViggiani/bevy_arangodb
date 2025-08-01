@@ -1,6 +1,6 @@
 use bevy::prelude::App;
 use bevy_arangodb::{
-    commit, Guid, Persist, PersistencePlugins, PersistenceQuery, TransactionOperation,
+    commit, Guid, Persist, PersistencePlugins, PersistenceQuery, TransactionOperation, Collection,
 };
 
 use crate::common::*;
@@ -306,12 +306,17 @@ async fn test_dsl_logical_combinations() {
 async fn test_load_with_schema_mismatch() {
     let (db, _container) = setup().await;
 
-    // GIVEN a bad Health document
+    // GIVEN a bad Health document with required fields
     let bad_health_doc = serde_json::json!({
+        "_key": "bad_doc",
+        "bevy_persistence_version": 1,
         Health::name(): { "value": "a string, not a number" }
     });
     let _key = db
-        .execute_transaction(vec![TransactionOperation::CreateDocument(bad_health_doc)])
+        .execute_transaction(vec![TransactionOperation::CreateDocument {
+            collection: Collection::Entities,
+            data: bad_health_doc,
+        }])
         .await
         .expect("Transaction to create bad doc failed")
         .remove(0);

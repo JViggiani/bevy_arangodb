@@ -9,7 +9,9 @@ use std::sync::Arc;
 use serde_json::Value;
 use crate::{DatabaseConnection, Guid, Persist, PersistenceSession};
 use crate::Collection;
+use crate::db::connection::BEVY_PERSISTENCE_VERSION_FIELD;
 use crate::dsl::{Expression, translate_expression};
+use crate::versioning::version_manager::VersionKey;
 use bevy::prelude::{Component, World};
 
 /// AQL query builder: select which components and filters to apply.
@@ -41,7 +43,8 @@ impl PersistenceQuery {
         fn collect(expr: &Expression, names: &mut Vec<&'static str>) {
             match expr {
                 Expression::Field { component_name, .. } => {
-                    if !names.contains(component_name) {
+                    // "_key" is a special field, not a component to be deserialized.
+                    if *component_name != "_key" && !names.contains(component_name) {
                         names.push(component_name);
                     }
                 }
@@ -62,21 +65,19 @@ impl PersistenceQuery {
     }
 
     /// Construct the AQL and bind-variables tuple.
-    fn build_aql(&self) -> (String, HashMap<String, Value>) {
+    fn build_aql(&self, full_docs: bool) -> (String, HashMap<String, Value>) {
         let mut bind_vars = HashMap::new();
         let mut aql = format!("FOR doc IN {}", Collection::Entities);
 
         let mut filters = Vec::new();
-
         if !self.component_names.is_empty() {
-            let component_filter = self.component_names
+            let comp_filter = self.component_names
                 .iter()
-                .map(|name| format!("doc.`{}` != null", name))
+                .map(|n| format!("doc.`{}` != null", n))
                 .collect::<Vec<_>>()
                 .join(" AND ");
-            filters.push(format!("({})", component_filter));
+            filters.push(format!("({})", comp_filter));
         }
-
         if let Some(expr) = &self.filter_expr {
             filters.push(translate_expression(expr, &mut bind_vars));
         }
@@ -88,16 +89,20 @@ impl PersistenceQuery {
             aql.push_str(&filters.join(" AND "));
         }
 
-        aql.push_str("\n  RETURN doc._key");
+        if full_docs {
+            aql.push_str("\n  RETURN doc");
+        } else {
+            aql.push_str("\n  RETURN doc._key");
+        }
         (aql, bind_vars)
     }
 
     /// Run the AQL, fetch matching keys, and return them.
     pub async fn fetch_ids(&self) -> Vec<String> {
-        let (aql, bind_vars) = self.build_aql();
-        let result = self.db.query(aql, bind_vars).await
-            .expect("AQL query failed");
-        result
+        let (aql, bind_vars) = self.build_aql(false);
+        self.db.query_keys(aql, bind_vars)
+            .await
+            .expect("AQL query failed")
     }
 
     /// Load matching entities into the World.
@@ -108,39 +113,50 @@ impl PersistenceQuery {
         // remove the session resource
         let mut session = world.remove_resource::<PersistenceSession>().unwrap();
 
-        // 1) run AQL to get matching keys
-        let keys = self.fetch_ids().await;
-        let mut result = Vec::new();
+        // fetch full documents in one go
+        let (aql, bind_vars) = self.build_aql(true);
+        let documents = self.db.query_documents(aql, bind_vars)
+            .await
+            .expect("Batch document fetch failed");
 
-        // 2) map existing guid→entity
-        let mut existing = std::collections::HashMap::new();
-        for (e, guid) in world.query::<(bevy::prelude::Entity, &Guid)>().iter(world) {
-            existing.insert(guid.id().to_string(), e);
+        let mut result = Vec::with_capacity(documents.len());
+        if !documents.is_empty() {
+            // map existing GUIDs→entities
+            let mut existing = HashMap::new();
+            for (e, guid) in world.query::<(bevy::prelude::Entity, &Guid)>().iter(world) {
+                existing.insert(guid.id().to_string(), e);
+            }
+
+            for doc in documents {
+                let key = doc["_key"].as_str().unwrap().to_string();
+                let version = doc[BEVY_PERSISTENCE_VERSION_FIELD].as_u64().unwrap();
+
+                let entity = if let Some(&e) = existing.get(&key) {
+                    e
+                } else {
+                    let e = world.spawn(Guid::new(key.clone())).id();
+                    existing.insert(key.clone(), e);
+                    e
+                };
+
+                session.version_manager.set_version(VersionKey::Entity(key.clone()), version);
+
+                for &comp in &self.component_names {
+                    if let Some(val) = doc.get(comp) {
+                        let deser = &session.component_deserializers[comp];
+                        deser(world, entity, val.clone())
+                            .expect("component deserialization failed");
+                    }
+                }
+
+                result.push(entity);
+            }
         }
 
-        // 3) spawn or reuse + insert components
-        for key in keys {
-            let e = if let Some(&e) = existing.get(&key) {
-                e
-            } else {
-                let new_e = world.spawn(Guid::new(key.clone())).id();
-                existing.insert(key.clone(), new_e);
-                new_e
-            };
-            session
-                .fetch_and_insert_document(&*self.db, world, &key, e, &self.component_names)
-                .await
-                .expect("component deserialization failed");
-            result.push(e);
-        }
-
-        // 4) insert resources
-        session
-            .fetch_and_insert_resources(&*self.db, world)
+        session.fetch_and_insert_resources(&*self.db, world)
             .await
             .expect("resource deserialization failed");
 
-        // 5) restore and return
         world.insert_resource(session);
         result
     }
@@ -173,7 +189,7 @@ mod tests {
                 .and(B::name().eq("test"))
             );
 
-        let (aql, bind_vars) = q.build_aql();
+        let (aql, bind_vars) = q.build_aql(false);
 
         // Should require presence of both components by their Persist::name()
         assert!(aql.contains(&format!("doc.`{}` != null", <A as Persist>::name())));
@@ -200,26 +216,11 @@ mod tests {
     #[tokio::test]
     async fn fetch_into_loads_new_entities() {
         let mut mock_db = MockDatabaseConnection::new();
-        mock_db.expect_query()
-            .returning(|_, _| Box::pin(async { Ok(vec!["k1".into(), "k2".into()]) }));
-
-        // The function under test, `fetch_into`, calls `fetch_document`, not `fetch_component`.
-        // We need to mock `fetch_document` to return a document containing the components.
-        mock_db.expect_fetch_document()
-            .returning(|key| {
-                let doc = if key == "k1" || key == "k2" {
-                    Some((
-                        json!({
-                            Health::name(): { "value": 10 },
-                            Position::name(): { "x": 1.0, "y": 2.0 }
-                        }),
-                        1u64, // version
-                    ))
-                } else {
-                    None
-                };
-                Box::pin(async { Ok(doc) })
-            });
+        mock_db.expect_query_documents()
+            .returning(|_, _| Box::pin(async { Ok(vec![
+                json!({"_key":"k1",BEVY_PERSISTENCE_VERSION_FIELD:1,"A":{}}),
+                json!({"_key":"k2",BEVY_PERSISTENCE_VERSION_FIELD:1,"A":{}}),
+            ]) }));
 
         // Due to test pollution from other modules, other resource types might be registered.
         // We must expect `fetch_resource` to be called, and we can just return `None`.
@@ -246,7 +247,7 @@ mod tests {
     #[test]
     fn build_query_empty_filters() {
         let db = Arc::new(MockDatabaseConnection::new());
-        let (aql, _) = PersistenceQuery::new(db).build_aql();
+        let (aql, _) = PersistenceQuery::new(db).build_aql(false);
         assert!(aql.contains("FILTER true"));
     }
 
@@ -254,7 +255,7 @@ mod tests {
     #[should_panic(expected = "AQL query failed")]
     fn fetch_ids_panics_on_error() {
         let mut mock_db = MockDatabaseConnection::new();
-        mock_db.expect_query().returning(|_, _| {
+        mock_db.expect_query_keys().returning(|_, _| {
             Box::pin(async { Err(crate::PersistenceError::General("db error".into())) })
         });
         let db = Arc::new(mock_db);
@@ -271,13 +272,13 @@ mod tests {
     #[test]
     fn build_query_single_and_multi() {
         let db = Arc::new(MockDatabaseConnection::new());
-        let (a_single, _) = PersistenceQuery::new(db.clone()).with::<H>().build_aql();
+        let (a_single, _) = PersistenceQuery::new(db.clone()).with::<H>().build_aql(false);
         assert!(a_single.contains(&format!("doc.`{}` != null", H::name())));
 
         let (a_multi, _) = PersistenceQuery::new(db)
             .with::<H>()
             .with::<P>()
-            .build_aql();
+            .build_aql(false);
         assert!(a_multi.contains(&format!("doc.`{}` != null", H::name())));
         assert!(a_multi.contains(&format!("doc.`{}` != null", P::name())));
     }

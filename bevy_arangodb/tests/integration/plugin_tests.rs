@@ -127,10 +127,22 @@ async fn test_queued_commit_persists_all_changes() {
 
     // AND data from both commits exists in the database
     let guid_a = app.world().get::<Guid>(entity_a).unwrap();
-    let health_json = db.fetch_component(guid_a.id(), Health::name()).await.unwrap().unwrap();
-    assert_eq!(serde_json::from_value::<Health>(health_json).unwrap().value, 100);
+    let health_json = db
+        .fetch_component(guid_a.id(), Health::name())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_value::<Health>(health_json).unwrap().value,
+        100
+    );
 
     let guid_b = app.world().get::<Guid>(entity_b).unwrap();
-    let pos_json = db.fetch_component(guid_b.id(), Position::name()).await.unwrap().unwrap();
-    assert_eq!(serde_json::from_value::<Position>(pos_json).unwrap().x, 50.0);
+    let pos_json = db
+        .fetch_component(guid_b.id(), Position::name())
+        .await
+        .unwrap()
+        .unwrap();
+    let pos: Position = serde_json::from_value(pos_json).unwrap();
+    assert_eq!(pos.x, 50.0);
 }

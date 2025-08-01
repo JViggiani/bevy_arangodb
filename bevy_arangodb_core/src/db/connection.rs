@@ -10,6 +10,7 @@ use std::fmt;
 pub const BEVY_PERSISTENCE_VERSION_FIELD: &str = "bevy_persistence_version";
 
 /// An enum representing the collections used by this library.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub enum Collection {
     /// The collection where all Bevy entities are stored as documents.
     Entities,
@@ -60,14 +61,33 @@ impl PersistenceError {
     }
 }
 
+/// Represents the version information for an optimistic locking operation.
+#[derive(serde::Serialize, Debug, Clone, Copy)]
+pub struct Version {
+    /// The version we expect the document to have in the database.
+    pub expected: u64,
+    /// The new version to set after a successful update.
+    pub new: u64,
+}
+
 /// Represents one DB operation in our atomic transaction.
 #[derive(serde::Serialize, Debug, Clone)]
 pub enum TransactionOperation {
-    CreateDocument(Value),
-    UpdateDocument { key: String, expected_version: u64, patch: Value },
-    DeleteDocument { key: String, expected_version: u64 },
-    CreateResource { key: String, data: Value },
-    UpdateResource { key: String, expected_version: u64, data: Value },
+    CreateDocument {
+        collection: Collection,
+        data: Value,
+    },
+    UpdateDocument {
+        collection: Collection,
+        key: String,
+        version: Version,
+        patch: Value,
+    },
+    DeleteDocument {
+        collection: Collection,
+        key: String,
+        version: Version,
+    },
 }
 
 /// Abstracts database operations via async returns but remains object-safe.
@@ -78,11 +98,17 @@ pub trait DatabaseConnection: Send + Sync + Downcast + fmt::Debug {
         operations: Vec<TransactionOperation>,
     ) -> BoxFuture<'static, Result<Vec<String>, PersistenceError>>;
 
-    fn query(
+    fn query_keys(
         &self,
         aql: String,
         bind_vars: std::collections::HashMap<String, Value>,
     ) -> BoxFuture<'static, Result<Vec<String>, PersistenceError>>;
+
+    fn query_documents(
+        &self,
+        aql: String,
+        bind_vars: std::collections::HashMap<String, Value>,
+    ) -> BoxFuture<'static, Result<Vec<Value>, PersistenceError>>;
 
     fn fetch_document(
         &self,

@@ -3,8 +3,8 @@
 
 use arangors::{
     client::reqwest::ReqwestClient,
-    transaction::{TransactionCollections, TransactionSettings},
     AqlQuery, ClientError, Connection, Database,
+    transaction::{TransactionCollections, TransactionSettings},
 };
 use crate::db::DatabaseConnection;
 use crate::db::connection::{PersistenceError, TransactionOperation, Collection, BEVY_PERSISTENCE_VERSION_FIELD};
@@ -69,36 +69,50 @@ impl ArangoDbConnection {
 }
 
 impl DatabaseConnection for ArangoDbConnection {
-    fn query(
+    fn query_keys(
         &self,
         aql: String,
         bind_vars: HashMap<String, Value>,
     ) -> BoxFuture<'static, Result<Vec<String>, PersistenceError>> {
         let db = self.db.clone();
         async move {
-            // convert String->Value into &'static str->Value
-            let bind_refs: HashMap<&'static str, Value> = bind_vars
-                .into_iter()
-                .map(|(k, v)| {
-                    let s: &'static str = Box::leak(k.into());
-                    (s, v)
-                })
-                .collect();
-
             let query = AqlQuery::builder()
                 .query(&aql)
-                .bind_vars(bind_refs)
+                .bind_vars(
+                    bind_vars.iter()
+                        .map(|(k,v)| (k.as_str(), v.clone()))
+                        .collect()
+                )
                 .build();
-            let docs: Vec<Value> = db
+            let result: Vec<String> = db
                 .aql_query(query)
                 .await
                 .map_err(|e| PersistenceError::new(e.to_string()))?;
-            // extract keys as strings
-            let keys = docs
-                .into_iter()
-                .filter_map(|v| v.as_str().map(ToOwned::to_owned))
-                .collect();
-            Ok(keys)
+            Ok(result)
+        }
+        .boxed()
+    }
+
+    fn query_documents(
+        &self,
+        aql: String,
+        bind_vars: HashMap<String, Value>,
+    ) -> BoxFuture<'static, Result<Vec<Value>, PersistenceError>> {
+        let db = self.db.clone();
+        async move {
+            let query = AqlQuery::builder()
+                .query(&aql)
+                .bind_vars(
+                    bind_vars.iter()
+                        .map(|(k,v)| (k.as_str(), v.clone()))
+                        .collect()
+                )
+                .build();
+            let result: Vec<Value> = db
+                .aql_query(query)
+                .await
+                .map_err(|e| PersistenceError::new(e.to_string()))?;
+            Ok(result)
         }
         .boxed()
     }
@@ -234,10 +248,11 @@ impl DatabaseConnection for ArangoDbConnection {
     ) -> BoxFuture<'static, Result<Vec<String>, PersistenceError>> {
         let db = self.db.clone();
         async move {
-            let ent = Collection::Entities.to_string();
-            let res = Collection::Resources.to_string();
             let collections = TransactionCollections::builder()
-                .write(vec![ent.clone(), res.clone()])
+                .write(vec![
+                    Collection::Entities.to_string(),
+                    Collection::Resources.to_string(),
+                ])
                 .build();
             let settings = TransactionSettings::builder()
                 .collections(collections)
@@ -251,41 +266,55 @@ impl DatabaseConnection for ArangoDbConnection {
 
             for op in operations {
                 match op {
-                    TransactionOperation::CreateDocument(doc) => {
-                        let col = trx.collection(&ent).await.map_err(|e| PersistenceError::new(e.to_string()))?;
-                        let meta = col.create_document(doc, Default::default()).await.map_err(|e| PersistenceError::new(e.to_string()))?;
-                        let key = meta.header().ok_or_else(|| PersistenceError::new("Missing header"))?._key.clone();
-                        new_keys.push(key);
+                    TransactionOperation::CreateDocument { collection, data } => {
+                        let col = trx
+                            .collection(&collection.to_string())
+                            .await
+                            .map_err(|e| PersistenceError::new(e.to_string()))?;
+                        let meta = col
+                            .create_document(data, Default::default())
+                            .await
+                            .map_err(|e| PersistenceError::new(e.to_string()))?;
+                        let key = meta
+                            .header()
+                            .ok_or_else(|| PersistenceError::new("Missing header"))?
+                            ._key
+                            .clone();
+                        if matches!(collection, Collection::Entities) {
+                            new_keys.push(key);
+                        }
                     }
-                    TransactionOperation::UpdateDocument { key, expected_version, patch } => {
-                        // Use AQL to atomically check version and update
+                    TransactionOperation::UpdateDocument {
+                        collection,
+                        key,
+                        version,
+                        patch,
+                    } => {
                         let aql = format!(
                             "LET doc = DOCUMENT('{}', @key) \
-                             FILTER doc != null AND doc.{} == @version \
+                             FILTER doc != null AND doc.{} == @expected_version \
                              UPDATE doc WITH @patch IN {} \
                              RETURN OLD",
-                            ent, BEVY_PERSISTENCE_VERSION_FIELD, ent
+                            collection, BEVY_PERSISTENCE_VERSION_FIELD, collection
                         );
 
-                        let mut bind_vars = HashMap::new();
-                        bind_vars.insert("key", Value::String(key.clone()));
-                        bind_vars.insert("version", Value::Number(expected_version.into()));
-                        bind_vars.insert("patch", patch);
-
-                        let bind_refs: HashMap<&'static str, Value> = bind_vars
-                            .into_iter()
-                            .map(|(k, v)| {
-                                let s: &'static str = Box::leak(k.into());
-                                (s, v)
-                            })
-                            .collect();
+                        let bind_vars: HashMap<String, Value> = [
+                            ("key".to_string(), Value::String(key.clone())),
+                            ("expected_version".to_string(), Value::Number(version.expected.into())),
+                            ("patch".to_string(), patch),
+                        ].into_iter().collect();
 
                         let query = AqlQuery::builder()
                             .query(&aql)
-                            .bind_vars(bind_refs)
+                            .bind_vars(
+                                bind_vars.iter()
+                                    .map(|(k,v)| (k.as_str(), v.clone()))
+                                    .collect()
+                            )
                             .build();
 
-                        let result: Vec<Value> = trx.aql_query(query)
+                        let result: Vec<Value> = trx
+                            .aql_query(query)
                             .await
                             .map_err(|e| PersistenceError::new(e.to_string()))?;
 
@@ -293,77 +322,35 @@ impl DatabaseConnection for ArangoDbConnection {
                             return Err(PersistenceError::Conflict { key });
                         }
                     }
-                    TransactionOperation::DeleteDocument { key, expected_version } => {
-                        // Use AQL to atomically check version and delete
+                    TransactionOperation::DeleteDocument {
+                        collection,
+                        key,
+                        version,
+                    } => {
                         let aql = format!(
                             "LET doc = DOCUMENT('{}', @key) \
-                             FILTER doc != null AND doc.{} == @version \
+                             FILTER doc != null AND doc.{} == @expected_version \
                              REMOVE doc IN {} \
                              RETURN OLD",
-                            ent, BEVY_PERSISTENCE_VERSION_FIELD, ent
+                            collection, BEVY_PERSISTENCE_VERSION_FIELD, collection
                         );
 
-                        let mut bind_vars = HashMap::new();
-                        bind_vars.insert("key", Value::String(key.clone()));
-                        bind_vars.insert("version", Value::Number(expected_version.into()));
-
-                        let bind_refs: HashMap<&'static str, Value> = bind_vars
-                            .into_iter()
-                            .map(|(k, v)| {
-                                let s: &'static str = Box::leak(k.into());
-                                (s, v)
-                            })
-                            .collect();
+                        let bind_vars: HashMap<String, Value> = [
+                            ("key".to_string(), Value::String(key.clone())),
+                            ("expected_version".to_string(), Value::Number(version.expected.into())),
+                        ].into_iter().collect();
 
                         let query = AqlQuery::builder()
                             .query(&aql)
-                            .bind_vars(bind_refs)
+                            .bind_vars(
+                                bind_vars.iter()
+                                    .map(|(k,v)| (k.as_str(), v.clone()))
+                                    .collect()
+                            )
                             .build();
 
-                        let result: Vec<Value> = trx.aql_query(query)
-                            .await
-                            .map_err(|e| PersistenceError::new(e.to_string()))?;
-
-                        if result.is_empty() {
-                            return Err(PersistenceError::Conflict { key });
-                        }
-                    }
-                    TransactionOperation::CreateResource { key, data } => {
-                        let col = trx.collection(&res).await.map_err(|e| PersistenceError::new(e.to_string()))?;
-                        let mut doc_with_key = data;
-                        if let Some(obj) = doc_with_key.as_object_mut() {
-                            obj.insert("_key".to_string(), Value::String(key.clone()));
-                        }
-                        col.create_document(doc_with_key, Default::default()).await.map_err(|e| PersistenceError::new(e.to_string()))?;
-                    }
-                    TransactionOperation::UpdateResource { key, expected_version, data } => {
-                        let aql = format!(
-                            "LET doc = DOCUMENT('{}', @key) \
-                             FILTER doc != null AND doc.{} == @version \
-                             UPDATE @key WITH @data IN {} \
-                             RETURN OLD",
-                            res, BEVY_PERSISTENCE_VERSION_FIELD, res
-                        );
-
-                        let mut bind_vars = HashMap::new();
-                        bind_vars.insert("key", Value::String(key.clone()));
-                        bind_vars.insert("version", Value::Number(expected_version.into()));
-                        bind_vars.insert("data", data);
-
-                        let bind_refs: HashMap<&'static str, Value> = bind_vars
-                            .into_iter()
-                            .map(|(k, v)| {
-                                let s: &'static str = Box::leak(k.into());
-                                (s, v)
-                            })
-                            .collect();
-
-                        let query = AqlQuery::builder()
-                            .query(&aql)
-                            .bind_vars(bind_refs)
-                            .build();
-
-                        let result: Vec<Value> = trx.aql_query(query)
+                        let result: Vec<Value> = trx
+                            .aql_query(query)
                             .await
                             .map_err(|e| PersistenceError::new(e.to_string()))?;
 
@@ -374,7 +361,9 @@ impl DatabaseConnection for ArangoDbConnection {
                 }
             }
 
-            trx.commit().await.map_err(|e| PersistenceError::new(e.to_string()))?;
+            trx.commit()
+                .await
+                .map_err(|e| PersistenceError::new(e.to_string()))?;
             Ok(new_keys)
         }
         .boxed()

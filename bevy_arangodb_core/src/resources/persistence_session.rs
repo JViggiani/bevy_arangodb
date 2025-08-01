@@ -1,8 +1,12 @@
 //! Core ECS‐to‐Arango bridge: defines `PersistenceSession`.
 //! Handles local cache, change tracking, and commit logic (create/update/delete).
 
-use crate::db::connection::{DatabaseConnection, TransactionOperation, PersistenceError, BEVY_PERSISTENCE_VERSION_FIELD};
+use crate::db::connection::{
+    DatabaseConnection, PersistenceError, TransactionOperation, Version,
+    BEVY_PERSISTENCE_VERSION_FIELD, Collection,
+};
 use crate::plugins::TriggerCommit;
+use crate::versioning::version_manager::{VersionKey, VersionManager};
 use bevy::prelude::{info, App, Component, Entity, Resource, World};
 use serde_json::Value;
 use std::{
@@ -34,10 +38,9 @@ pub struct PersistenceSession {
     pub despawned_entities: HashSet<Entity>,
     pub entity_keys: HashMap<Entity, String>,
     pub dirty_resources: HashSet<TypeId>,
-    pub(crate) entity_versions: HashMap<Entity, u64>,
-    pub(crate) resource_versions: HashMap<TypeId, u64>,
+    pub(crate) version_manager: VersionManager,
     component_serializers: HashMap<TypeId, ComponentSerializer>,
-    component_deserializers: HashMap<String, ComponentDeserializer>,
+    pub(crate) component_deserializers: HashMap<String, ComponentDeserializer>,
     resource_serializers: HashMap<TypeId, ResourceSerializer>,
     resource_deserializers: HashMap<String, ResourceDeserializer>,
     resource_name_to_type_id: HashMap<String, TypeId>,
@@ -88,11 +91,7 @@ impl PersistenceSession {
         let ser_key = R::name();
         let type_id = std::any::TypeId::of::<R>();
         // Insert serializer into map keyed by TypeId
-        self.resource_serializers.insert(type_id, Box::new(move |world, session| {
-            // Only serialize if resource marked dirty
-            if !session.dirty_resources.contains(&type_id) {
-                return Ok(None);
-            }
+        self.resource_serializers.insert(type_id, Box::new(move |world, _session| {
             // Fetch and serialize the resource
             if let Some(r) = world.get_resource::<R>() {
                 let v = serde_json::to_value(r).map_err(|e| PersistenceError::new(e.to_string()))?;
@@ -140,8 +139,7 @@ impl PersistenceSession {
             despawned_entities: HashSet::new(),
             dirty_resources: HashSet::new(),
             entity_keys: HashMap::new(),
-            entity_versions: HashMap::new(),
-            resource_versions: HashMap::new(),
+            version_manager: VersionManager::new(),
         }
     }
 
@@ -158,8 +156,7 @@ impl PersistenceSession {
             despawned_entities: HashSet::new(),
             dirty_resources: HashSet::new(),
             entity_keys: HashMap::new(),
-            entity_versions: HashMap::new(),
-            resource_versions: HashMap::new(),
+            version_manager: VersionManager::new(),
         }
     }
 
@@ -175,8 +172,9 @@ impl PersistenceSession {
     ) -> Result<(), PersistenceError> {
         if let Some((doc, version)) = db.fetch_document(key).await? {
             // Cache the version
-            self.entity_versions.insert(entity, version);
-            
+            self.version_manager
+                .set_version(VersionKey::Entity(key.to_string()), version);
+
             // Deserialize requested components
             for &comp_name in component_names {
                 if let Some(val) = doc.get(comp_name) {
@@ -200,7 +198,8 @@ impl PersistenceSession {
             if let Some((val, version)) = db.fetch_resource(res_name).await? {
                 // Cache the version based on the resource's TypeId using the map.
                 if let Some(type_id) = self.resource_name_to_type_id.get(res_name) {
-                    self.resource_versions.insert(*type_id, version);
+                    self.version_manager
+                        .set_version(VersionKey::Resource(*type_id), version);
                 }
                 deser(world, val)?;
             }
@@ -233,23 +232,37 @@ impl PersistenceSession {
 pub(crate) fn _prepare_commit(
     session: &PersistenceSession,
     world: &World,
+    dirty_entities: &HashSet<Entity>,
+    despawned_entities: &HashSet<Entity>,
+    dirty_resources: &HashSet<TypeId>,
 ) -> Result<CommitData, PersistenceError> {
-    let mut operations = Vec::new();
+    let mut operations = Vec::with_capacity(
+        despawned_entities.len()
+            + dirty_entities.len()
+            + dirty_resources.len(),
+    );
     let mut new_entities = Vec::new();
 
     // Deletions
-    for &e in &session.despawned_entities {
+    for &e in despawned_entities {
         if let Some(key) = session.entity_keys.get(&e) {
-            let version = session.entity_versions.get(&e)
+            let version_key = VersionKey::Entity(key.clone());
+            let expected_version = session
+                .version_manager
+                .get_version(&version_key)
                 .ok_or_else(|| PersistenceError::new("Missing version for deletion"))?;
-            operations.push(TransactionOperation::DeleteDocument { 
-                key: key.clone(), 
-                expected_version: *version 
+            operations.push(TransactionOperation::DeleteDocument {
+                collection: Collection::Entities,
+                key: key.clone(),
+                version: Version {
+                    expected: expected_version,
+                    new: 0, // Not used for deletes
+                },
             });
         }
     }
     // Creations & Updates
-    for &e in &session.dirty_entities {
+    for &e in dirty_entities {
         let mut map = serde_json::Map::new();
         for ser in session.component_serializers.values() {
             if let Some((n, v)) = ser(e, world)? {
@@ -263,47 +276,74 @@ pub(crate) fn _prepare_commit(
 
         if let Some(key) = session.entity_keys.get(&e) {
             // Update existing document
-            let version = session.entity_versions.get(&e)
+            let version_key = VersionKey::Entity(key.clone());
+            let expected_version = session
+                .version_manager
+                .get_version(&version_key)
                 .ok_or_else(|| PersistenceError::new("Missing version for update"))?;
-            
-            // Inject new version into patch
-            map.insert(BEVY_PERSISTENCE_VERSION_FIELD.to_string(), serde_json::json!(version + 1));
-            
+
+            let new_version = expected_version + 1;
+            map.insert(
+                BEVY_PERSISTENCE_VERSION_FIELD.to_string(),
+                serde_json::json!(new_version),
+            );
+
             operations.push(TransactionOperation::UpdateDocument {
+                collection: Collection::Entities,
                 key: key.clone(),
-                expected_version: *version,
+                version: Version {
+                    expected: expected_version,
+                    new: new_version,
+                },
                 patch: Value::Object(map),
             });
         } else {
             // Create new document with initial version
             map.insert(BEVY_PERSISTENCE_VERSION_FIELD.to_string(), serde_json::json!(1u64));
-            
+
             let doc = Value::Object(map);
-            operations.push(TransactionOperation::CreateDocument(doc));
+            operations.push(TransactionOperation::CreateDocument {
+                collection: Collection::Entities,
+                data: doc,
+            });
             new_entities.push(e);
         }
     }
     // Resources
-    for &tid in &session.dirty_resources {
+    for &tid in dirty_resources {
         if let Some(ser) = session.resource_serializers.get(&tid) {
             if let Some((n, mut v)) = ser(world, session)? {
-                if let Some(&version) = session.resource_versions.get(&tid) {
+                let version_key = VersionKey::Resource(tid);
+                if let Some(expected_version) = session.version_manager.get_version(&version_key) {
                     // Update existing resource
+                    let new_version = expected_version + 1;
                     if let Some(obj) = v.as_object_mut() {
-                        obj.insert(BEVY_PERSISTENCE_VERSION_FIELD.to_string(), serde_json::json!(version + 1));
+                        obj.insert(
+                            BEVY_PERSISTENCE_VERSION_FIELD.to_string(),
+                            serde_json::json!(new_version),
+                        );
                     }
-                    operations.push(TransactionOperation::UpdateResource {
+                    operations.push(TransactionOperation::UpdateDocument {
+                        collection: Collection::Resources,
                         key: n,
-                        expected_version: version,
-                        data: v,
+                        version: Version {
+                            expected: expected_version,
+                            new: new_version,
+                        },
+                        patch: v,
                     });
                 } else {
                     // Create new resource
                     if let Some(obj) = v.as_object_mut() {
-                        obj.insert(BEVY_PERSISTENCE_VERSION_FIELD.to_string(), serde_json::json!(1u64));
+                        obj.insert(
+                            BEVY_PERSISTENCE_VERSION_FIELD.to_string(),
+                            serde_json::json!(1u64),
+                        );
+                        // Resources use their name as the _key
+                        obj.insert("_key".to_string(), Value::String(n.clone()));
                     }
-                    operations.push(TransactionOperation::CreateResource {
-                        key: n,
+                    operations.push(TransactionOperation::CreateDocument {
+                        collection: Collection::Resources,
                         data: v,
                     });
                 }
