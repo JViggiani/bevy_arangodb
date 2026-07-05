@@ -8,15 +8,25 @@ use std::any::TypeId;
 /// Automatically marks entities with added/changed components as dirty.
 pub fn auto_dirty_tracking_entity_system<T: Component + 'static>(
     mut session: ResMut<PersistenceSession>,
-    query: Query<Entity, Or<(Added<T>, Changed<T>)>>,
+    changed: Query<Entity, Changed<T>>,
+    added: Query<Entity, Added<T>>,
 ) {
-    for entity in query.iter() {
+    let type_id = TypeId::of::<T>();
+    for entity in changed.iter() {
         bevy::log::debug!(
-            "Marking entity {:?} as dirty due to component {}",
+            "Marking entity {:?} as dirty due to changed component {}",
             entity,
             std::any::type_name::<T>()
         );
-        session.mark_entity_component_dirty(entity, TypeId::of::<T>());
+        session.track_component_changed(entity, type_id, added.contains(entity));
+    }
+    for entity in added.iter() {
+        bevy::log::debug!(
+            "Marking entity {:?} as dirty due to added component {}",
+            entity,
+            std::any::type_name::<T>()
+        );
+        session.track_component_added(entity, type_id);
     }
 }
 
@@ -27,7 +37,7 @@ pub fn auto_dirty_tracking_resource_system<T: Resource + 'static>(
 ) {
     if let Some(resource) = resource {
         if resource.is_changed() {
-            session.mark_resource_dirty::<T>();
+            session.track_resource_changed(TypeId::of::<T>());
         }
     }
 }
@@ -48,16 +58,15 @@ pub fn auto_dirty_tracking_bevy_relationship_system<
             entity,
             std::any::type_name::<R>()
         );
-        session.mark_relationship_entity_dirty(entity);
+        session.track_relationship_entity_changed(entity);
     }
-    // Also mark entities whose relationship component was removed entirely.
     for entity in removed.read() {
         bevy::log::debug!(
             "Marking entity {:?} as relationship-dirty due to removal of Relationship<{}>",
             entity,
             std::any::type_name::<R>()
         );
-        session.mark_relationship_entity_dirty(entity);
+        session.track_relationship_entity_changed(entity);
     }
 }
 
@@ -74,17 +83,15 @@ pub fn auto_dirty_tracking_relationship_system<R: Send + Sync + 'static>(
             entity,
             std::any::type_name::<R>()
         );
-        session.mark_relationship_entity_dirty(entity);
+        session.track_relationship_entity_changed(entity);
     }
-    // When the last relationship is removed the OutgoingRelationships component
-    // is dropped entirely — that fires RemovedComponents, not Changed.
     for entity in removed.read() {
         bevy::log::debug!(
             "Marking entity {:?} as relationship-dirty due to removal of OutgoingRelationships<{}>",
             entity,
             std::any::type_name::<R>()
         );
-        session.mark_relationship_entity_dirty(entity);
+        session.track_relationship_entity_changed(entity);
     }
 }
 
@@ -118,6 +125,7 @@ pub(crate) fn auto_despawn_tracking_system(
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
+    use serde_json::json;
 
     #[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct TestHealth {
@@ -141,25 +149,20 @@ mod tests {
 
         let entity = app.world_mut().spawn(TestHealth { value: 100 }).id();
 
-        // First update will mark it as dirty because it was just added
         app.update();
 
-        // Clear dirty state
         {
             let mut session = app.world_mut().resource_mut::<PersistenceSession>();
             session.clear_dirty_entity_components();
         }
 
-        // Read the component without modifying it
         {
             let health = app.world().get::<TestHealth>(entity).unwrap();
             assert_eq!(health.value, 100);
         }
 
-        // Update again - tracking system runs
         app.update();
 
-        // Verify the entity wasn't marked dirty after read-only access
         {
             let session = app.world().resource::<PersistenceSession>();
             assert!(
@@ -168,13 +171,11 @@ mod tests {
             );
         }
 
-        // Now mutate the component
         {
             let mut health = app.world_mut().get_mut::<TestHealth>(entity).unwrap();
             health.value = 200;
         }
 
-        // Update again - should mark as dirty
         app.update();
 
         {
@@ -182,6 +183,95 @@ mod tests {
             assert!(
                 session.is_entity_dirty(entity),
                 "Entity should be marked dirty after modification"
+            );
+        }
+    }
+
+    #[test]
+    fn hydration_scope_suppresses_added_dirt() {
+        use super::super::ecs_plumbing::finish_hydration;
+        use super::super::plugin::PersistenceSystemSet;
+
+        let mut app = App::new();
+        app.add_plugins(bevy::prelude::MinimalPlugins);
+        app.configure_sets(
+            PostUpdate,
+            (
+                PersistenceSystemSet::TrackChanges,
+                PersistenceSystemSet::FinishHydration,
+            )
+                .chain(),
+        );
+
+        let mut session = PersistenceSession::new();
+        session.register_component_named::<TestHealth>("TestHealth");
+        app.insert_resource(session);
+
+        app.add_systems(
+            PostUpdate,
+            auto_dirty_tracking_entity_system::<TestHealth>.in_set(PersistenceSystemSet::TrackChanges),
+        );
+        app.add_systems(
+            PostUpdate,
+            finish_hydration.in_set(PersistenceSystemSet::FinishHydration),
+        );
+
+        let entity = app.world_mut().spawn_empty().id();
+        app.world_mut().resource_scope(|world, mut session: Mut<PersistenceSession>| {
+            session
+                .hydrate_entity_component(
+                    world,
+                    entity,
+                    "TestHealth",
+                    json!({ "value": 1 }),
+                )
+                .expect("hydrate should succeed");
+        });
+
+        app.update();
+
+        let session = app.world().resource::<PersistenceSession>();
+        assert!(
+            !session.is_entity_dirty(entity),
+            "components inserted under hydration scope must not mark dirty"
+        );
+        assert!(
+            !session.is_hydrating(),
+            "hydration scope should end after finish_hydration"
+        );
+    }
+
+    #[test]
+    fn post_load_mutation_marks_dirty() {
+        let mut app = App::new();
+        app.add_plugins(bevy::prelude::MinimalPlugins);
+
+        let mut session = PersistenceSession::new();
+        session.register_component_named::<TestHealth>("TestHealth");
+        app.insert_resource(session);
+
+        app.add_systems(
+            Update,
+            auto_dirty_tracking_entity_system::<TestHealth>,
+        );
+
+        let entity = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .entity_mut(entity)
+            .insert(TestHealth { value: 100 });
+
+        {
+            let mut health = app.world_mut().get_mut::<TestHealth>(entity).unwrap();
+            health.value = 200;
+        }
+
+        app.update();
+
+        {
+            let session = app.world().resource::<PersistenceSession>();
+            assert!(
+                session.is_entity_dirty(entity),
+                "post-load user mutation must mark dirty"
             );
         }
     }

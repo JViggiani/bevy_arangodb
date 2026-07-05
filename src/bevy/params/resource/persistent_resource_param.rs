@@ -1,5 +1,6 @@
 use std::marker::PhantomData;
 
+use bevy::ecs::component::Mutable;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::{Mut, Resource, World};
 
@@ -8,12 +9,30 @@ use crate::bevy::world_access::ImmediateWorldPtr;
 use crate::core::db::connection::DatabaseConnectionResource;
 use crate::core::persist::Persist;
 use crate::core::session::PersistenceSession;
-use crate::core::versioning::version_manager::VersionKey;
 use super::resource_thread_local::{
     set_resource_force_refresh, set_resource_store, take_resource_force_refresh,
     take_resource_store,
 };
-use serde_json::Value;
+
+fn load_registered_resource<T: Resource + Persist>(
+    session: &mut PersistenceSession,
+    db: &DatabaseConnectionResource,
+    runtime: &TokioRuntime,
+    config: &PersistencePluginConfig,
+    world_ptr: *mut World,
+) {
+    let store = take_resource_store().unwrap_or_else(|| config.default_store.clone());
+    let world: &mut World = unsafe { &mut *world_ptr };
+    let connection = db.connection.clone();
+    let res_name = T::name();
+
+    match runtime.block_on(session.materialize_resource(&*connection, &store, world, res_name)) {
+        Ok(true) | Ok(false) => {}
+        Err(err) => {
+            bevy::log::error!(%err, store, "failed to load persisted resource {}", res_name);
+        }
+    }
+}
 
 /// Read-only persisted resource accessor. Hydrates on first use if absent.
 #[derive(SystemParam)]
@@ -68,44 +87,13 @@ impl<'w, T: Resource + Persist> PersistentRes<'w, T> {
             return;
         };
 
-        let store = take_resource_store().unwrap_or_else(|| self.config.default_store.clone());
-
-        let result = self
-            .runtime
-            .block_on(async { self.db.connection.fetch_resource(&store, T::name()).await });
-
-        match result {
-            Ok(Some((value, version))) => {
-                if let Err(err) = self.deserialize_into_world(world_ptr.ptr, value) {
-                    bevy::log::error!(
-                        "failed to deserialize persisted resource {}: {}",
-                        T::name(),
-                        err
-                    );
-                    return;
-                }
-                if let Some(type_id) = self.session.resource_type_id(T::name()) {
-                    self.session
-                        .version_manager_mut()
-                        .set_version(VersionKey::Resource(type_id), version);
-                }
-            }
-            Ok(None) => {}
-            Err(err) => {
-                bevy::log::error!(%err, store, "failed to load persisted resource {}", T::name());
-            }
-        }
-    }
-
-    fn deserialize_into_world(
-        &mut self,
-        world_ptr: *mut World,
-        value: Value,
-    ) -> Result<(), String> {
-        let world: &mut World = unsafe { &mut *world_ptr };
-        self.session
-            .deserialize_resource_by_name(world, T::name(), value)
-            .map_err(|e| e.to_string())
+        load_registered_resource::<T>(
+            &mut self.session,
+            &self.db,
+            &self.runtime,
+            &self.config,
+            world_ptr.ptr,
+        );
     }
 
     fn resource_ref(&self) -> Option<&T> {
@@ -115,7 +103,7 @@ impl<'w, T: Resource + Persist> PersistentRes<'w, T> {
     }
 }
 
-impl<'w, T: Resource + Persist> PersistentResMut<'w, T> {
+impl<'w, T: Resource<Mutability = Mutable> + Persist> PersistentResMut<'w, T> {
     /// Override the store for the next load of this resource.
     pub fn store(self, store: impl Into<String>) -> Self {
         set_resource_store(store);
@@ -153,44 +141,13 @@ impl<'w, T: Resource + Persist> PersistentResMut<'w, T> {
             return;
         };
 
-        let store = take_resource_store().unwrap_or_else(|| self.config.default_store.clone());
-
-        let result = self
-            .runtime
-            .block_on(async { self.db.connection.fetch_resource(&store, T::name()).await });
-
-        match result {
-            Ok(Some((value, version))) => {
-                if let Err(err) = self.deserialize_into_world(world_ptr.ptr, value) {
-                    bevy::log::error!(
-                        "failed to deserialize persisted resource {}: {}",
-                        T::name(),
-                        err
-                    );
-                    return;
-                }
-                if let Some(type_id) = self.session.resource_type_id(T::name()) {
-                    self.session
-                        .version_manager_mut()
-                        .set_version(VersionKey::Resource(type_id), version);
-                }
-            }
-            Ok(None) => {}
-            Err(err) => {
-                bevy::log::error!(%err, store, "failed to load persisted resource {}", T::name());
-            }
-        }
-    }
-
-    fn deserialize_into_world(
-        &mut self,
-        world_ptr: *mut World,
-        value: Value,
-    ) -> Result<(), String> {
-        let world: &mut World = unsafe { &mut *world_ptr };
-        self.session
-            .deserialize_resource_by_name(world, T::name(), value)
-            .map_err(|e| e.to_string())
+        load_registered_resource::<T>(
+            &mut self.session,
+            &self.db,
+            &self.runtime,
+            &self.config,
+            world_ptr.ptr,
+        );
     }
 
     fn resource_ref(&self) -> Option<&T> {
@@ -209,7 +166,7 @@ impl<'w, T: Resource + Persist> PersistentResMut<'w, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::db::connection::{DatabaseConnectionResource, MockDatabaseConnection};
+    use crate::core::db::{MockDatabaseConnection, connection::DatabaseConnectionResource};
     use crate::bevy::plugins::persistence_plugin::TokioRuntime;
     use bevy::prelude::App;
     use bevy::prelude::MinimalPlugins;
@@ -250,7 +207,8 @@ mod tests {
         db.expect_fetch_resource().returning(|store, name| {
             assert_eq!(store, "store");
             assert_eq!(name, TestResource::name());
-            Box::pin(async { Ok(Some((json!({ "value": "persisted" }), 3))) })
+            // Single-field `#[persist]` → stable `{"value": …}` object shape on disk.
+            Box::pin(async { Ok(Some((json!({"value": "persisted"}), 3))) })
         });
         db.expect_document_key_field().return_const("_key");
 
@@ -319,7 +277,7 @@ mod tests {
 
         let mut db = MockDatabaseConnection::new();
         db.expect_fetch_resource()
-            .returning(|_, _| Box::pin(async { Ok(Some((json!({ "value": "persisted" }), 1))) }));
+            .returning(|_, _| Box::pin(async { Ok(Some((json!({"value": "persisted"}), 1))) }));
         db.expect_document_key_field().return_const("_key");
 
         app.insert_resource(DatabaseConnectionResource {

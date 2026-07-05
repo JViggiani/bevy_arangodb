@@ -1,4 +1,4 @@
-use bevy::ecs::query::{QueryData, QueryFilter, QueryState};
+use bevy::ecs::query::{IterQueryData, QueryData, QueryFilter, QueryState, SingleEntityQueryData};
 use bevy::ecs::system::QueryLens;
 use bevy::prelude::{Entity, World};
 
@@ -12,7 +12,7 @@ use super::query_thread_local::{
 
 impl<'w, 's, Q, F> PersistentQuery<'w, 's, Q, F>
 where
-    Q: QueryData<ReadOnly = Q> + QueryDataToComponents,
+    Q: QueryData<ReadOnly = Q> + IterQueryData + QueryDataToComponents,
     F: QueryFilter + ToPresenceSpec + FilterSupported,
 {
     /// Smart join between two PersistentQuery params:
@@ -24,9 +24,9 @@ where
         other: &'a mut PersistentQuery<'w2, 's2, Q2, F2>,
     ) -> QueryLens<'a, NewD, NewF>
     where
-        Q2: QueryData<ReadOnly = Q2> + QueryDataToComponents,
+        Q2: QueryData<ReadOnly = Q2> + IterQueryData + QueryDataToComponents,
         F2: QueryFilter + ToPresenceSpec + FilterSupported,
-        NewD: bevy::ecs::query::QueryData,
+        NewD: SingleEntityQueryData,
         NewF: bevy::ecs::query::QueryFilter,
     {
         bevy::log::debug!(

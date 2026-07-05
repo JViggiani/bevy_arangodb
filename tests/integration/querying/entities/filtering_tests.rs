@@ -1,8 +1,91 @@
 use crate::common::*;
 use bevy_persistence_database::bevy::components::Guid;
 use bevy_persistence_database::bevy::params::query::PersistentQuery;
+use bevy_persistence_database::core::db::DatabaseConnection;
+use bevy_persistence_database::core::query::FilterExpression;
 use bevy_persistence_database::core::session::commit_sync;
 use bevy_persistence_database_derive::db_matrix_test;
+use std::sync::Arc;
+
+/// Run a single `PersistentQuery` load against a fresh app.
+///
+/// Bevy's schedule keeps internal resources that are invalidated by
+/// `World::clear_entities`; re-registering systems on the same app after a
+/// clear panics. Each filter assertion therefore gets its own app instance.
+fn assert_health_filter_count(
+    db: Arc<dyn DatabaseConnection>,
+    filter: FilterExpression,
+    expected: usize,
+) {
+    let mut app = setup_test_app(db, None);
+    app.add_systems(bevy::prelude::Update, move |pq: PersistentQuery<&Health>| {
+        let _ = pq.filter(filter.clone()).load();
+    });
+    app.update();
+    let count = app
+        .world_mut()
+        .query::<&Health>()
+        .iter(app.world())
+        .count();
+    assert_eq!(count, expected);
+}
+
+fn assert_creature_filter_count(
+    db: Arc<dyn DatabaseConnection>,
+    filter: FilterExpression,
+    expected: usize,
+) {
+    let mut app = setup_test_app(db, None);
+    app.add_systems(bevy::prelude::Update, move |pq: PersistentQuery<&Creature>| {
+        let _ = pq.filter(filter.clone()).load();
+    });
+    app.update();
+    let count = app
+        .world_mut()
+        .query::<&Creature>()
+        .iter(app.world())
+        .count();
+    assert_eq!(count, expected);
+}
+
+fn assert_player_name_filter_count(
+    db: Arc<dyn DatabaseConnection>,
+    filter: FilterExpression,
+    expected: usize,
+) {
+    let mut app = setup_test_app(db, None);
+    app.add_systems(bevy::prelude::Update, move |pq: PersistentQuery<&PlayerName>| {
+        let _ = pq.filter(filter.clone()).load();
+    });
+    app.update();
+    let count = app
+        .world_mut()
+        .query::<&PlayerName>()
+        .iter(app.world())
+        .count();
+    assert_eq!(count, expected);
+}
+
+fn assert_health_position_filter_count(
+    db: Arc<dyn DatabaseConnection>,
+    filter: FilterExpression,
+    expected: usize,
+) {
+    let mut app = setup_test_app(db, None);
+    app.add_systems(
+        bevy::prelude::Update,
+        move |pq: PersistentQuery<(&Health, &Position)>| {
+            let _ = pq.filter(filter.clone()).load();
+        },
+    );
+    app.update();
+    let count = app
+        .world_mut()
+        .query::<(&Health, &Position)>()
+        .iter(app.world())
+        .count();
+    assert_eq!(count, expected);
+}
 
 #[db_matrix_test]
 fn test_value_filters_equality_operator() {
@@ -23,47 +106,9 @@ fn test_value_filters_equality_operator() {
     app.update();
     commit_sync(&mut app, db.clone(), TEST_STORE).expect("Initial commit failed");
 
-    // Health == 100
-    let mut app2 = setup_test_app(db.clone(), None);
-    fn s1(pq: PersistentQuery<&Health>) {
-        let _ = pq.filter(Health::value().eq(100)).load();
-    }
-    app2.add_systems(bevy::prelude::Update, s1);
-    app2.update();
-    let count_h = app2
-        .world_mut()
-        .query::<&Health>()
-        .iter(&app2.world())
-        .count();
-    assert_eq!(count_h, 1);
-
-    // Creature.is_screaming == true
-    app2.world_mut().clear_entities();
-    fn s2(pq: PersistentQuery<&Creature>) {
-        let _ = pq.filter(Creature::is_screaming().eq(true)).load();
-    }
-    app2.add_systems(bevy::prelude::Update, s2);
-    app2.update();
-    let count_c = app2
-        .world_mut()
-        .query::<&Creature>()
-        .iter(&app2.world())
-        .count();
-    assert_eq!(count_c, 1);
-
-    // PlayerName == "Alice"
-    app2.world_mut().clear_entities();
-    fn s3(pq: PersistentQuery<&PlayerName>) {
-        let _ = pq.filter(PlayerName::name().eq("Alice")).load();
-    }
-    app2.add_systems(bevy::prelude::Update, s3);
-    app2.update();
-    let count_p = app2
-        .world_mut()
-        .query::<&PlayerName>()
-        .iter(&app2.world())
-        .count();
-    assert_eq!(count_p, 1);
+    assert_health_filter_count(db.clone(), Health::value().eq(100), 1);
+    assert_creature_filter_count(db.clone(), Creature::is_screaming().eq(true), 1);
+    assert_player_name_filter_count(db.clone(), PlayerName::name().eq("Alice"), 1);
 }
 
 #[db_matrix_test]
@@ -78,65 +123,10 @@ fn test_value_filters_relational_operators() {
     app.update();
     commit_sync(&mut app, db.clone(), TEST_STORE).expect("Initial commit failed");
 
-    // gt(100) -> 1
-    let mut app2 = setup_test_app(db.clone(), None);
-    fn gt(pq: PersistentQuery<&Health>) {
-        let _ = pq.filter(Health::value().gt(100)).load();
-    }
-    app2.add_systems(bevy::prelude::Update, gt);
-    app2.update();
-    assert_eq!(
-        app2.world_mut()
-            .query::<&Health>()
-            .iter(&app2.world())
-            .count(),
-        1
-    );
-
-    // gte(100) -> 2
-    app2.world_mut().clear_entities();
-    fn gte(pq: PersistentQuery<&Health>) {
-        let _ = pq.filter(Health::value().gte(100)).load();
-    }
-    app2.add_systems(bevy::prelude::Update, gte);
-    app2.update();
-    assert_eq!(
-        app2.world_mut()
-            .query::<&Health>()
-            .iter(&app2.world())
-            .count(),
-        2
-    );
-
-    // lt(100) -> 1
-    app2.world_mut().clear_entities();
-    fn lt(pq: PersistentQuery<&Health>) {
-        let _ = pq.filter(Health::value().lt(100)).load();
-    }
-    app2.add_systems(bevy::prelude::Update, lt);
-    app2.update();
-    assert_eq!(
-        app2.world_mut()
-            .query::<&Health>()
-            .iter(&app2.world())
-            .count(),
-        1
-    );
-
-    // lte(100) -> 2
-    app2.world_mut().clear_entities();
-    fn lte(pq: PersistentQuery<&Health>) {
-        let _ = pq.filter(Health::value().lte(100)).load();
-    }
-    app2.add_systems(bevy::prelude::Update, lte);
-    app2.update();
-    assert_eq!(
-        app2.world_mut()
-            .query::<&Health>()
-            .iter(&app2.world())
-            .count(),
-        2
-    );
+    assert_health_filter_count(db.clone(), Health::value().gt(100), 1);
+    assert_health_filter_count(db.clone(), Health::value().gte(100), 2);
+    assert_health_filter_count(db.clone(), Health::value().lt(100), 1);
+    assert_health_filter_count(db.clone(), Health::value().lte(100), 2);
 }
 
 #[db_matrix_test]
@@ -156,36 +146,15 @@ fn test_value_filters_logical_combinations() {
     app.update();
     commit_sync(&mut app, db.clone(), TEST_STORE).expect("Initial commit failed");
 
-    let mut app2 = setup_test_app(db.clone(), None);
-
-    fn and_sys(pq: PersistentQuery<(&Health, &Position)>) {
-        let expr = Health::value().gt(100).and(Position::x().lt(100.0));
-        let _ = pq.filter(expr).load();
-    }
-    fn or_sys(pq: PersistentQuery<(&Health, &Position)>) {
-        let expr = Health::value().gt(100).or(Position::x().lt(100.0));
-        let _ = pq.filter(expr).load();
-    }
-
-    app2.add_systems(bevy::prelude::Update, and_sys);
-    app2.update();
-    assert_eq!(
-        app2.world_mut()
-            .query::<(&Health, &Position)>()
-            .iter(&app2.world())
-            .count(),
-        1
+    assert_health_position_filter_count(
+        db.clone(),
+        Health::value().gt(100).and(Position::x().lt(100.0)),
+        1,
     );
-
-    app2.world_mut().clear_entities();
-    app2.add_systems(bevy::prelude::Update, or_sys);
-    app2.update();
-    assert_eq!(
-        app2.world_mut()
-            .query::<(&Health, &Position)>()
-            .iter(&app2.world())
-            .count(),
-        3
+    assert_health_position_filter_count(
+        db.clone(),
+        Health::value().gt(100).or(Position::x().lt(100.0)),
+        3,
     );
 }
 

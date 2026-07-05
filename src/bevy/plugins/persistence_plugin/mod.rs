@@ -5,7 +5,7 @@ mod listeners;
 mod plugin;
 mod runtime;
 
-pub use commit::{CommitCompleted, CommitStatus, TriggerCommit};
+pub use commit::{commit_in_flight, CommitCompleted, CommitStatus, TriggerCommit};
 pub use dirty_tracking::{auto_dirty_tracking_entity_system, auto_dirty_tracking_resource_system};
 #[cfg(not(feature = "bevy_many_relationship_edges"))]
 #[doc(hidden)]

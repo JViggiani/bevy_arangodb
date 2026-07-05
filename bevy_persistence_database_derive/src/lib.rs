@@ -28,35 +28,33 @@ pub fn persist(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut ast = parse_macro_input!(item as Item);
 
     // Derive Component/Resource and serde for non-unit types, skip serde for unit structs to allow manual impls
+    let mut single_field_serde: Option<proc_macro2::TokenStream> = None;
+
     if let Item::Struct(s) = &mut ast {
+        let is_single_field = match &s.fields {
+            syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => true,
+            syn::Fields::Named(fields) if fields.named.len() == 1 => true,
+            _ => false,
+        };
+
         if is_comp {
-            s.attrs.push(syn::parse_quote!(
-                #[derive(::bevy::prelude::Component, ::serde::Serialize, ::serde::Deserialize)]
-            ));
-            // Add `#[serde(transparent)]` to any single-field struct (tuple or named).
-            // This keeps newtype wrappers stable on the wire / in persistence.
-            match &s.fields {
-                syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
-                    s.attrs.push(syn::parse_quote!(#[serde(transparent)]));
-                }
-                syn::Fields::Named(fields) if fields.named.len() == 1 => {
-                    s.attrs.push(syn::parse_quote!(#[serde(transparent)]));
-                }
-                _ => {}
+            if is_single_field {
+                s.attrs.push(syn::parse_quote!(#[derive(::bevy::prelude::Component)]));
+            } else {
+                s.attrs.push(syn::parse_quote!(
+                    #[derive(::bevy::prelude::Component, ::serde::Serialize, ::serde::Deserialize)]
+                ));
             }
+            single_field_serde = single_field_serde_tokens(s, is_single_field);
         } else if is_res {
-            s.attrs.push(syn::parse_quote!(
-                #[derive(::bevy::prelude::Resource, ::serde::Serialize, ::serde::Deserialize)]
-            ));
-            match &s.fields {
-                syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
-                    s.attrs.push(syn::parse_quote!(#[serde(transparent)]));
-                }
-                syn::Fields::Named(fields) if fields.named.len() == 1 => {
-                    s.attrs.push(syn::parse_quote!(#[serde(transparent)]));
-                }
-                _ => {}
+            if is_single_field {
+                s.attrs.push(syn::parse_quote!(#[derive(::bevy::prelude::Resource)]));
+            } else {
+                s.attrs.push(syn::parse_quote!(
+                    #[derive(::bevy::prelude::Resource, ::serde::Serialize, ::serde::Deserialize)]
+                ));
             }
+            single_field_serde = single_field_serde_tokens(s, is_single_field);
         } else {
             // Relationship: Serialize/Deserialize only needed for the bevy_many_relationship_edges
             // payload path. The native Bevy relationship path (feature off) uses structs that
@@ -64,19 +62,9 @@ pub fn persist(attr: TokenStream, item: TokenStream) -> TokenStream {
             s.attrs.push(syn::parse_quote!(
                 #[cfg_attr(feature = "bevy_many_relationship_edges", derive(::serde::Serialize, ::serde::Deserialize))]
             ));
-            // #[serde(transparent)] is likewise only valid in the payload path.
-            match &s.fields {
-                syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
-                    s.attrs.push(syn::parse_quote!(
-                        #[cfg_attr(feature = "bevy_many_relationship_edges", serde(transparent))]
-                    ));
-                }
-                syn::Fields::Named(fields) if fields.named.len() == 1 => {
-                    s.attrs.push(syn::parse_quote!(
-                        #[cfg_attr(feature = "bevy_many_relationship_edges", serde(transparent))]
-                    ));
-                }
-                _ => {}
+            #[cfg(feature = "bevy_many_relationship_edges")]
+            {
+                single_field_serde = single_field_serde_tokens(s, true);
             }
         }
     } else if let Item::Enum(e) = &mut ast {
@@ -189,9 +177,100 @@ pub fn persist(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Combine all generated code
     TokenStream::from(quote! {
         #ast
+        #single_field_serde
         #impl_persist
         #field_methods
         #auto_registration
+    })
+}
+
+/// Single-field persisted types always serialize as `{ "field": value }` so adding
+/// more fields later does not flip the on-disk shape from scalar to object.
+/// Deserialization also accepts the legacy bare scalar produced by the old
+/// `#[serde(transparent)]` representation for backward compatibility.
+fn single_field_serde_tokens(
+    s: &syn::ItemStruct,
+    enabled: bool,
+) -> Option<proc_macro2::TokenStream> {
+    if !enabled {
+        return None;
+    }
+
+    let (field_ident, field_name, field_ty) = match &s.fields {
+        syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+            let field = fields.unnamed.first()?;
+            (
+                syn::Member::Unnamed(syn::Index::from(0)),
+                "0".to_string(),
+                &field.ty,
+            )
+        }
+        syn::Fields::Named(fields) if fields.named.len() == 1 => {
+            let field = fields.named.first()?;
+            let ident = field.ident.as_ref()?;
+            (syn::Member::Named(ident.clone()), ident.to_string(), &field.ty)
+        }
+        _ => return None,
+    };
+
+    let struct_ident = &s.ident;
+    let field_name_lit = syn::LitStr::new(&field_name, proc_macro2::Span::call_site());
+    let serde_mod = format_ident!("__persist_serde_{}", struct_ident);
+
+    Some(quote! {
+        #[allow(non_snake_case)]
+        mod #serde_mod {
+            use super::#struct_ident;
+            use ::serde::de::Error as _;
+            use ::serde::{Deserialize, Deserializer, Serialize, Serializer};
+            use ::serde::ser::SerializeStruct;
+
+            pub fn serialize<S>(value: &#struct_ident, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: ::serde::Serializer,
+            {
+                let mut state = serializer.serialize_struct(stringify!(#struct_ident), 1)?;
+                state.serialize_field(#field_name_lit, &value.#field_ident)?;
+                state.end()
+            }
+
+            pub fn deserialize<'de, D>(deserializer: D) -> Result<#struct_ident, D::Error>
+            where
+                D: ::serde::Deserializer<'de>,
+            {
+                let raw = ::serde_json::Value::deserialize(deserializer)?;
+                let inner = if let Some(obj) = raw.as_object() {
+                    obj.get(#field_name_lit)
+                        .cloned()
+                        .unwrap_or(raw)
+                } else {
+                    raw
+                };
+                let field_value: #field_ty =
+                    ::serde_json::from_value(inner).map_err(D::Error::custom)?;
+                Ok(#struct_ident {
+                    #field_ident: field_value,
+                })
+            }
+        }
+
+        impl ::serde::Serialize for #struct_ident {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: ::serde::Serializer,
+            {
+                #serde_mod::serialize(self, serializer)
+            }
+        }
+
+        impl<'de> ::serde::Deserialize<'de> for #struct_ident {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: ::serde::Deserializer<'de>,
+            {
+                #serde_mod::deserialize(deserializer)
+            }
+        }
     })
 }
 

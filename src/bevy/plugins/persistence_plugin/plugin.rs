@@ -4,9 +4,7 @@ use super::commit::{
 use super::dirty_tracking::{
     auto_despawn_tracking_resource_system, auto_despawn_tracking_system,
 };
-use super::ecs_plumbing::{
-    apply_deferred_world_ops, insert_initial_immediate_world_ptr, publish_immediate_world_ptr,
-};
+use super::ecs_plumbing::{apply_deferred_world_ops, finish_hydration, insert_initial_immediate_world_ptr, publish_immediate_world_ptr};
 use super::listeners::{commit_event_listener, init_commit_listeners};
 use super::runtime::{TokioRuntime, ensure_task_pools};
 use crate::bevy::params::query::{InFlightQueries, PersistenceQueryCache};
@@ -23,8 +21,12 @@ use std::sync::Arc;
 /// A Bevy `SystemSet` for grouping the core persistence systems into ordered phases.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PersistenceSystemSet {
-    /// Systems that run first to apply deferred operations and detect changes.
-    ChangeDetection,
+    /// Apply deferred load operations (must run before dirty tracking).
+    LoadApply,
+    /// ECS change detection for persistence dirty sets.
+    TrackChanges,
+    /// Close hydration scopes opened during load (must run after dirty tracking).
+    FinishHydration,
     /// Systems that prepare commits after change detection has finished.
     PreCommit,
     /// The system that finalizes the commit.
@@ -54,8 +56,8 @@ pub struct RegisteredPersistTypes {
 /// Configuration for the persistence plugin.
 #[derive(Resource, Clone)]
 pub struct PersistencePluginConfig {
-    pub batching_enabled: bool,
-    pub commit_batch_size: usize,
+    /// Rayon thread count for parallel commit preparation (serialization).
+    /// When `1`, prepare runs serially.
     pub thread_count: usize,
     pub default_store: String,
 }
@@ -63,8 +65,6 @@ pub struct PersistencePluginConfig {
 impl Default for PersistencePluginConfig {
     fn default() -> Self {
         Self {
-            batching_enabled: true,
-            commit_batch_size: 1000,
             thread_count: 4,
             default_store: "default_store".to_string(),
         }
@@ -140,7 +140,9 @@ impl Plugin for PersistencePluginCore {
         app.configure_sets(
             PostUpdate,
             (
-                PersistenceSystemSet::ChangeDetection,
+                PersistenceSystemSet::LoadApply,
+                PersistenceSystemSet::TrackChanges,
+                PersistenceSystemSet::FinishHydration,
                 PersistenceSystemSet::PreCommit,
                 PersistenceSystemSet::Commit,
             )
@@ -152,10 +154,17 @@ impl Plugin for PersistencePluginCore {
             (
                 apply_deferred_world_ops,
                 publish_immediate_world_ptr,
+            )
+                .in_set(PersistenceSystemSet::LoadApply),
+        );
+
+        app.add_systems(
+            PostUpdate,
+            (
                 auto_despawn_tracking_system,
                 auto_despawn_tracking_resource_system,
             )
-                .in_set(PersistenceSystemSet::ChangeDetection),
+                .in_set(PersistenceSystemSet::TrackChanges),
         );
 
         app.add_systems(
@@ -166,6 +175,11 @@ impl Plugin for PersistencePluginCore {
         app.add_systems(
             PostUpdate,
             handle_commit_completed.in_set(PersistenceSystemSet::Commit),
+        );
+
+        app.add_systems(
+            PostUpdate,
+            finish_hydration.in_set(PersistenceSystemSet::FinishHydration),
         );
     }
 }

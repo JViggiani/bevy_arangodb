@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 #[db_matrix_test]
 fn test_successful_batch_commit_of_new_entities() {
     let (db, _c) = setup();
-    let mut app = make_app(db.clone(), 2);
+    let mut app = make_app(db.clone());
 
     // spawn 10 new entities
     for i in 0..10 {
@@ -55,7 +55,7 @@ fn test_successful_batch_commit_of_new_entities() {
 #[db_matrix_test]
 fn test_batch_commit_with_updates_and_deletes() {
     let (db, _c) = setup();
-    let mut app = make_app(db.clone(), 2);
+    let mut app = make_app(db.clone());
 
     // initial 5 entities
     let ids: Vec<_> = (0..5)
@@ -95,7 +95,7 @@ fn test_batch_commit_with_updates_and_deletes() {
 #[test]
 fn test_batch_commit_failure_propagates() {
     let (db, _c) = crate::common::setup_sync();
-    let mut app = make_app(db.clone(), 2);
+    let mut app = make_app(db.clone());
 
     // initial 5
     let ids: Vec<_> = (0..5)
@@ -140,16 +140,13 @@ fn test_batch_commit_failure_propagates() {
 }
 
 #[test]
-fn test_concurrent_batch_execution() {
-    // Create a mock database that introduces a delay for each batch
+fn test_atomic_commit_single_transaction() {
     let mut db = MockDatabaseConnection::new();
     db.expect_document_key_field().return_const("_key");
-    let batch_count = 5;
     let batch_delay = Duration::from_millis(50);
 
-    // Configure the mock to delay each transaction by batch_delay
     db.expect_execute_transaction()
-        .times(batch_count)
+        .times(1)
         .returning(move |_ops| {
             Box::pin(async move {
                 tokio::time::sleep(batch_delay).await;
@@ -158,112 +155,70 @@ fn test_concurrent_batch_execution() {
         });
 
     let db_arc = Arc::new(db);
-    let batch_size = 2;
-    let entity_count = batch_count * batch_size;
+    let entity_count = 10;
 
-    // Create an app with batching enabled and configured batch size
     let config = PersistencePluginConfig {
-        batching_enabled: true,
-        commit_batch_size: batch_size,
         thread_count: 4,
         default_store: TEST_STORE.to_string(),
+        ..Default::default()
     };
-    let mut app = setup_test_app(db_arc.clone(), Some(config.clone()));
+    let mut app = setup_test_app(db_arc.clone(), Some(config));
 
-    // Spawn enough entities to create `batch_count` batches
     for i in 0..entity_count {
         app.world_mut().spawn(Health { value: i as i32 });
     }
     app.update();
 
-    // Measure time for the commit operation
     let start_time = Instant::now();
     let res = commit_sync(&mut app, db_arc.clone(), TEST_STORE);
     let elapsed = start_time.elapsed();
 
     assert!(res.is_ok());
-
-    // Total time should be slightly more than one batch delay, but much less than all delays combined
-    let total_sequential_delay = batch_delay * batch_count as u32;
-    println!("Elapsed time for concurrent commit: {:?}", elapsed);
-    println!(
-        "Total sequential delay would be: {:?}",
-        total_sequential_delay
-    );
-
     assert!(
-        elapsed < total_sequential_delay,
-        "Concurrent execution was not faster than sequential."
+        elapsed >= batch_delay,
+        "Elapsed time should be at least one transaction delay."
     );
     assert!(
-        elapsed > batch_delay,
-        "Elapsed time should be at least one batch delay."
-    );
-    // A reasonable upper bound for concurrency with some overhead
-    assert!(
-        elapsed < batch_delay * 2,
-        "Concurrent execution took too long."
+        elapsed < batch_delay * 3,
+        "Atomic commit should not wait for multiple sequential transaction delays."
     );
 }
 
 #[test]
-fn test_atomic_multi_batch_commit() {
-    // Create a mock database that will succeed for the first N-1 batches but fail on the last one
+fn test_atomic_commit_failure_rolls_back_all() {
     let mut db = MockDatabaseConnection::new();
     db.expect_document_key_field().return_const("_key");
-    let batch_count = 3;
-    let batch_to_fail = 2; // Zero-indexed, so this is the third batch
 
-    let mut call_count = 0;
     db.expect_execute_transaction()
-        .times(batch_count)
-        .returning(move |_| {
-            let current_batch = call_count;
-            call_count += 1;
-
+        .times(1)
+        .returning(|_| {
             Box::pin(async move {
-                // Sleep to simulate network latency
                 tokio::time::sleep(Duration::from_millis(20)).await;
-
-                // Make the specified batch fail
-                if current_batch == batch_to_fail {
-                    return Err(PersistenceError::new("Simulated failure in batch"));
-                }
-
-                // Return empty keys for successful batches
-                Ok(vec![])
+                Err(PersistenceError::new("Simulated failure in transaction"))
             })
         });
 
     let db_arc = Arc::new(db);
     let config = PersistencePluginConfig {
-        batching_enabled: true,
-        commit_batch_size: 3,
         thread_count: 2,
         default_store: TEST_STORE.to_string(),
+        ..Default::default()
     };
     let mut app = setup_test_app(db_arc.clone(), Some(config));
 
-    // Spawn enough entities to create multiple batches
-    let entity_count = batch_count * 3; // use commit_batch_size = 3
-    for i in 0..entity_count {
+    for i in 0..9 {
         app.world_mut().spawn(Health { value: i as i32 });
     }
     app.update();
 
-    // Attempt the commit operation
     let result = commit_sync(&mut app, db_arc.clone(), TEST_STORE);
 
-    // The entire operation should fail due to the failure in one batch
     assert!(result.is_err());
     assert!(
         matches!(result, Err(PersistenceError::General(msg)) if msg.contains("Simulated failure"))
     );
-
-    // The status should be reset to Idle after a failure
     assert_eq!(*app.world().resource::<CommitStatus>(), CommitStatus::Idle);
 
-    // No entity should have a Guid since the commit failed atomically
     let world_ref = app.world_mut();
     let guid_count = world_ref.query::<&Guid>().iter(world_ref).count();
     assert_eq!(
@@ -273,51 +228,35 @@ fn test_atomic_multi_batch_commit() {
 }
 
 #[test]
-fn test_batches_respect_config_max_ops() {
-    use bevy_persistence_database::bevy::plugins::persistence_plugin::PersistencePluginConfig;
-    use bevy_persistence_database::core::db::MockDatabaseConnection;
-    use bevy_persistence_database::core::session::commit_sync;
-    use std::sync::Arc;
-
-    // Configure a non-trivial batch size and entity count
-    let batch_size = 7usize;
+fn test_atomic_commit_includes_all_operations() {
     let entity_count = 25usize;
-    let expected_batches = (entity_count + batch_size - 1) / batch_size;
 
-    // Mock DB: ensure we get exactly expected_batches transactions and that
-    // each batch contains <= batch_size operations.
     let mut db = MockDatabaseConnection::new();
     db.expect_document_key_field().return_const("_key");
     db.expect_execute_transaction()
-        .times(expected_batches)
+        .times(1)
         .returning(move |ops| {
-            assert!(
-                ops.len() <= batch_size,
-                "Batch too large: got {}, limit {}",
+            assert_eq!(
                 ops.len(),
-                batch_size
+                entity_count,
+                "expected all entity creates in one atomic transaction"
             );
-            // Simulate success
             Box::pin(async { Ok(vec![]) })
         });
 
-    // Build app with batching enabled
     let config = PersistencePluginConfig {
-        batching_enabled: true,
-        commit_batch_size: batch_size,
         thread_count: 4,
         default_store: TEST_STORE.to_string(),
+        ..Default::default()
     };
     let conn = Arc::new(db);
     let mut app = setup_test_app(conn.clone(), Some(config));
 
-    // Spawn enough entities to require multiple batches
     for i in 0..entity_count {
         app.world_mut().spawn(Health { value: i as i32 });
     }
     app.update();
 
-    // Commit: mock assertions will validate batch sizing and call count
     let res = commit_sync(&mut app, conn, TEST_STORE);
     assert!(res.is_ok(), "Commit should succeed with mocked DB");
 }

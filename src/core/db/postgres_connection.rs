@@ -6,7 +6,10 @@ use crate::core::db::connection::{
     BEVY_PERSISTENCE_DATABASE_VERSION_FIELD, DatabaseConnection, DocumentKind, EdgeDocument,
     PersistenceError, TransactionOperation, read_version,
 };
-use crate::core::db::shared::{GroupedOperations, OperationType, check_operation_success, extract_keys};
+use crate::core::db::shared::{
+    EnsuredStores, GroupedOperations, OperationType, check_operation_success, escape_sql_literal,
+    extract_keys,
+};
 use crate::core::query::{
     BinaryOperator, EdgeQuerySpecification, FilterExpression, PersistenceQuerySpecification,
 };
@@ -14,12 +17,11 @@ use bevy::log::{debug, error, info};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde_json::Value;
-use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use deadpool_postgres::{Config as PoolConfig, Pool, Runtime};
 use tokio_postgres::types::ToSql;
-use tokio_postgres::{Client, Config, NoTls};
+use tokio_postgres::{Config, NoTls};
 
 // Local constants to avoid magic strings
 const KEY_COL: &str = "id";
@@ -53,7 +55,8 @@ fn quote_ident(name: &str) -> String {
 
 #[derive(Clone)]
 pub struct PostgresDbConnection {
-    client: Arc<Mutex<Client>>,
+    pool: Pool,
+    ensured: Arc<EnsuredStores>,
 }
 
 impl fmt::Debug for PostgresDbConnection {
@@ -117,28 +120,40 @@ impl PostgresDbConnection {
             cfg.port(p);
         }
 
-        let (client, connection) = cfg
-            .connect(NoTls)
-            .await
-            .map_err(|e| PersistenceError::new(format!("pg connect failed: {}", e)))?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                error!("postgres connection error: {}", e);
-            }
-        });
+        let mut pool_cfg = PoolConfig::new();
+        pool_cfg.host = Some(host.to_string());
+        pool_cfg.user = Some(user.to_string());
+        pool_cfg.password = Some(pass.to_string());
+        pool_cfg.dbname = Some(db_name.to_string());
+        if let Some(p) = port {
+            pool_cfg.port = Some(p);
+        }
+        let pool = pool_cfg
+            .create_pool(Some(Runtime::Tokio1), NoTls)
+            .map_err(|e| PersistenceError::new(format!("pg pool create failed: {}", e)))?;
 
-        let db = Self {
-            client: Arc::new(Mutex::new(client)),
-        };
-        Ok(db)
+        Ok(Self {
+            pool,
+            ensured: Arc::new(EnsuredStores::default()),
+        })
+    }
+
+    async fn client(&self) -> Result<deadpool_postgres::Client, PersistenceError> {
+        self.pool
+            .get()
+            .await
+            .map_err(|e| PersistenceError::new(format!("pg pool get failed: {}", e)))
     }
 
     async fn ensure_store_table(&self, store: &str) -> Result<String, PersistenceError> {
         if store.is_empty() {
             return Err(PersistenceError::new("store must be provided"));
         }
+        if self.ensured.is_ensured(store) {
+            return Ok(quote_ident(store));
+        }
         let table = quote_ident(store);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         debug!("[pg] ensuring store table {}", table);
         let stmt = format!(
             r#"
@@ -155,14 +170,18 @@ impl PostgresDbConnection {
             .batch_execute(&stmt)
             .await
             .map_err(|e| PersistenceError::new(format!("pg ensure store table failed: {:?}", e)))?;
+        self.ensured.mark_ensured(store);
         Ok(table)
     }
 
     /// Ensure the edge table `{store}__edges` exists, creating it if needed.
     async fn ensure_edge_table(&self, store: &str) -> Result<String, PersistenceError> {
         let table_name = format!("{}__edges", store);
+        if self.ensured.is_ensured(&table_name) {
+            return Ok(quote_ident(&table_name));
+        }
         let table = quote_ident(&table_name);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         debug!("[pg] ensuring edge table {}", table);
         let stmt = format!(
             r#"
@@ -180,6 +199,7 @@ impl PostgresDbConnection {
             .batch_execute(&stmt)
             .await
             .map_err(|e| PersistenceError::new(format!("pg ensure edge table failed: {:?}", e)))?;
+        self.ensured.mark_ensured(table_name);
         Ok(table)
     }
 
@@ -197,7 +217,7 @@ impl PostgresDbConnection {
             let cond = spec
                 .presence_with
                 .iter()
-                .map(|n| format!("doc ? '{}'", n))
+                .map(|n| format!("doc ? '{}'", escape_sql_literal(n)))
                 .collect::<Vec<_>>()
                 .join(" AND ");
             clauses.push(format!("({})", cond));
@@ -207,7 +227,7 @@ impl PostgresDbConnection {
             let cond = spec
                 .presence_without
                 .iter()
-                .map(|n| format!("NOT (doc ? '{}')", n))
+                .map(|n| format!("NOT (doc ? '{}')", escape_sql_literal(n)))
                 .collect::<Vec<_>>()
                 .join(" AND ");
             clauses.push(format!("({})", cond));
@@ -231,11 +251,11 @@ impl PostgresDbConnection {
     // Translate FilterExpression to SQL with typed params
     fn translate_expr(expr: &FilterExpression, offset: usize) -> (String, Vec<SqlParam>) {
         fn field_path(component: &str, field: &str) -> String {
+            let component = escape_sql_literal(component);
             if field.is_empty() {
-                // presence is handled specially; still return doc->'Comp' for casts
                 format!("doc -> '{}'", component)
             } else {
-                // text extract; cast in ops below
+                let field = escape_sql_literal(field);
                 format!("doc -> '{}' ->> '{}'", component, field)
             }
         }
@@ -475,7 +495,6 @@ impl PostgresDbConnection {
         key: String,
         kind: DocumentKind,
     ) -> BoxFuture<'static, Result<Option<(Value, u64)>, PersistenceError>> {
-        let client = self.client.clone();
         let conn = self.clone();
         async move {
             let table = conn.ensure_store_table(&store).await?;
@@ -488,7 +507,7 @@ impl PostgresDbConnection {
                 table = table,
                 key_col = KEY_COL,
             );
-            let c = client.lock().await;
+            let c = conn.client().await?;
             let row_opt = c
                 .query_opt(&stmt, &[&key, &kind.as_str()])
                 .await
@@ -515,7 +534,6 @@ impl DatabaseConnection for PostgresDbConnection {
         spec: &PersistenceQuerySpecification,
     ) -> BoxFuture<'static, Result<Vec<String>, PersistenceError>> {
         let (where_sql, params) = Self::build_where(spec);
-        let client = self.client.clone();
         let conn = self.clone();
         let store = spec.store.clone();
         let table = quote_ident(&store);
@@ -532,7 +550,7 @@ impl DatabaseConnection for PostgresDbConnection {
                 t = table,
                 w = where_sql
             );
-            let client = client.lock().await;
+            let client = conn.client().await?;
             let boxed: Vec<Box<dyn ToSql + Sync + Send>> =
                 params.into_iter().map(|p| p.into_box()).collect();
             let param_refs: Vec<&(dyn ToSql + Sync)> =
@@ -552,7 +570,6 @@ impl DatabaseConnection for PostgresDbConnection {
     ) -> BoxFuture<'static, Result<Vec<Value>, PersistenceError>> {
         let spec = spec.clone();
         let (where_sql, params) = Self::build_where(&spec);
-        let client = self.client.clone();
         let conn = self.clone();
         bevy::log::debug!(
             "[pg] execute_documents: store={} fetch_only={:?}; return_full_docs={}; params_len={}",
@@ -606,7 +623,7 @@ impl DatabaseConnection for PostgresDbConnection {
                 )
             };
 
-            let client = client.lock().await;
+            let client = conn.client().await?;
             let boxed: Vec<Box<dyn ToSql + Sync + Send>> =
                 params.into_iter().map(|p| p.into_box()).collect();
             let param_refs: Vec<&(dyn ToSql + Sync)> =
@@ -632,7 +649,6 @@ impl DatabaseConnection for PostgresDbConnection {
     ) -> BoxFuture<'static, Result<usize, PersistenceError>> {
         let spec = spec.clone();
         let (where_sql, params) = Self::build_where(&spec);
-        let client = self.client.clone();
         let conn = self.clone();
         bevy::log::debug!(
             "[pg] count_documents: store={} params_len={}",
@@ -646,7 +662,7 @@ impl DatabaseConnection for PostgresDbConnection {
                 t = table,
                 w = where_sql
             );
-            let client = client.lock().await;
+            let client = conn.client().await?;
             let boxed: Vec<Box<dyn ToSql + Sync + Send>> =
                 params.into_iter().map(|p| p.into_box()).collect();
             let param_refs: Vec<&(dyn ToSql + Sync)> =
@@ -666,7 +682,6 @@ impl DatabaseConnection for PostgresDbConnection {
         spec: &EdgeQuerySpecification,
     ) -> BoxFuture<'static, Result<Vec<EdgeDocument>, PersistenceError>> {
         let spec = spec.clone();
-        let client = self.client.clone();
         let conn = self.clone();
         async move {
             if spec.store.is_empty() || spec.depth == 0 {
@@ -703,7 +718,7 @@ impl DatabaseConnection for PostgresDbConnection {
                     edge_table, where_sql
                 );
 
-                let client = client.lock().await;
+                let client = conn.client().await?;
                 let param_refs: Vec<&(dyn ToSql + Sync)> =
                     params.iter().map(|p| &**p as &(dyn ToSql + Sync)).collect();
                 let rows = client
@@ -725,69 +740,78 @@ impl DatabaseConnection for PostgresDbConnection {
                 return Ok(edges);
             }
 
-            let mut all_edges: Vec<EdgeDocument> = Vec::new();
-            let mut seen_keys: HashSet<String> = HashSet::new();
-            let mut frontier: Vec<String> = spec.from_guids.clone();
-
-            for _ in 0..spec.depth {
-                if frontier.is_empty() {
-                    break;
-                }
-
-                let mut clauses: Vec<String> = Vec::new();
-                let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
-
-                if !spec.relationship_types.is_empty() {
-                    params.push(Box::new(spec.relationship_types.clone()));
-                    let idx = params.len();
-                    clauses.push(format!("relationship_type = ANY(${})", idx));
-                }
-
-                params.push(Box::new(frontier.clone()));
-                let from_idx = params.len();
-                clauses.push(format!("from_guid = ANY(${})", from_idx));
-
-                if !spec.to_guids.is_empty() {
-                    params.push(Box::new(spec.to_guids.clone()));
-                    let idx = params.len();
-                    clauses.push(format!("to_guid = ANY(${})", idx));
-                }
-
-                let where_sql = clauses.join(" AND ");
-                let sql = format!(
-                    "SELECT id, relationship_type, from_guid, to_guid, payload FROM {} WHERE {}",
-                    edge_table, where_sql
-                );
-                let client = client.lock().await;
-                let param_refs: Vec<&(dyn ToSql + Sync)> =
-                    params.iter().map(|p| &**p as &(dyn ToSql + Sync)).collect();
-                let rows = client
-                    .query(&sql, param_refs.as_slice())
-                    .await
-                    .map_err(|e| PersistenceError::new(format!("pg query_edges failed: {}", e)))?;
-
-                let mut edges = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let payload: Option<Value> = row.get("payload");
-                    edges.push(EdgeDocument {
-                        key: row.get("id"),
-                        relationship_type: row.get("relationship_type"),
-                        from_guid: row.get("from_guid"),
-                        to_guid: row.get("to_guid"),
-                        payload,
-                    });
-                }
-                let mut next_frontier: Vec<String> = Vec::new();
-                for edge in edges {
-                    if seen_keys.insert(edge.key.clone()) {
-                        next_frontier.push(edge.to_guid.clone());
-                        all_edges.push(edge);
-                    }
-                }
-                frontier = next_frontier;
+            let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
+            params.push(Box::new(spec.from_guids.clone()));
+            let from_idx = params.len();
+            if !spec.relationship_types.is_empty() {
+                params.push(Box::new(spec.relationship_types.clone()));
             }
+            let types_idx = params.len();
+            if !spec.to_guids.is_empty() {
+                params.push(Box::new(spec.to_guids.clone()));
+            }
+            let to_idx = params.len();
+            params.push(Box::new(spec.depth as i32));
+            let depth_idx = params.len();
 
-            Ok(all_edges)
+            let rel_filter = if spec.relationship_types.is_empty() {
+                "TRUE".to_string()
+            } else {
+                format!("e.relationship_type = ANY(${types_idx})")
+            };
+            let to_filter = if spec.to_guids.is_empty() {
+                "TRUE".to_string()
+            } else {
+                format!("e.to_guid = ANY(${to_idx})")
+            };
+
+            let sql = format!(
+                r#"
+                WITH RECURSIVE bfs AS (
+                    SELECT e.id, e.relationship_type, e.from_guid, e.to_guid, e.payload, 1 AS depth
+                    FROM {edge_table} e
+                    WHERE e.from_guid = ANY(${from_idx})
+                      AND ({rel_filter})
+                      AND ({to_filter})
+                    UNION ALL
+                    SELECT e.id, e.relationship_type, e.from_guid, e.to_guid, e.payload, b.depth + 1
+                    FROM {edge_table} e
+                    INNER JOIN bfs b ON e.from_guid = b.to_guid
+                    WHERE b.depth < ${depth_idx}
+                      AND ({rel_filter})
+                      AND ({to_filter})
+                )
+                SELECT DISTINCT ON (id) id, relationship_type, from_guid, to_guid, payload
+                FROM bfs
+                ORDER BY id, depth
+                "#,
+                edge_table = edge_table,
+                from_idx = from_idx,
+                depth_idx = depth_idx,
+                rel_filter = rel_filter,
+                to_filter = to_filter,
+            );
+
+            let client = conn.client().await?;
+            let param_refs: Vec<&(dyn ToSql + Sync)> =
+                params.iter().map(|p| &**p as &(dyn ToSql + Sync)).collect();
+            let rows = client
+                .query(&sql, param_refs.as_slice())
+                .await
+                .map_err(|e| PersistenceError::new(format!("pg query_edges failed: {}", e)))?;
+
+            let edges = rows
+                .into_iter()
+                .map(|row| EdgeDocument {
+                    key: row.get("id"),
+                    relationship_type: row.get("relationship_type"),
+                    from_guid: row.get("from_guid"),
+                    to_guid: row.get("to_guid"),
+                    payload: row.get("payload"),
+                })
+                .collect();
+
+            Ok(edges)
         }
         .boxed()
     }
@@ -796,7 +820,6 @@ impl DatabaseConnection for PostgresDbConnection {
         &self,
         operations: Vec<TransactionOperation>,
     ) -> futures::future::BoxFuture<'static, Result<Vec<String>, PersistenceError>> {
-        let client_arc = self.client.clone();
         let conn = self.clone();
         async move {
             let first = operations.get(0).ok_or_else(|| PersistenceError::new("execute_transaction requires at least one operation"))?;
@@ -821,7 +844,7 @@ impl DatabaseConnection for PostgresDbConnection {
                 None
             };
 
-            let mut client = client_arc.lock().await;
+            let mut client = conn.client().await?;
             let tx = client
                 .transaction()
                 .await
@@ -1139,7 +1162,6 @@ impl DatabaseConnection for PostgresDbConnection {
         let comp = comp_name.to_string();
         let store_name = store.to_string();
         let conn = self.clone();
-        let client = self.client.clone();
         async move {
             let table = conn.ensure_store_table(&store_name).await?;
             debug!(
@@ -1152,7 +1174,7 @@ impl DatabaseConnection for PostgresDbConnection {
                 k = KEY_COL,
                 type_col = BEVY_PERSISTENCE_DATABASE_BEVY_TYPE_FIELD
             );
-            let client = client.lock().await;
+            let client = conn.client().await?;
             let row_opt = client
                 .query_opt(&stmt, &[&key, &comp, &DocumentKind::Entity.as_str()])
                 .await
@@ -1186,7 +1208,6 @@ impl DatabaseConnection for PostgresDbConnection {
     ) -> BoxFuture<'static, Result<(), PersistenceError>> {
         let store_name = store.to_string();
         let conn = self.clone();
-        let client = self.client.clone();
         async move {
             let table = conn.ensure_store_table(&store_name).await?;
             let stmt = format!(
@@ -1194,7 +1215,7 @@ impl DatabaseConnection for PostgresDbConnection {
                 t = table,
                 type_col = BEVY_PERSISTENCE_DATABASE_BEVY_TYPE_FIELD
             );
-            let client = client.lock().await;
+            let client = conn.client().await?;
             client
                 .execute(&stmt, &[&kind.as_str()])
                 .await

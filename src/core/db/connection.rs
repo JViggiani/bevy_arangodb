@@ -3,7 +3,6 @@
 use crate::core::query::{EdgeQuerySpecification, PersistenceQuerySpecification};
 use bevy::prelude::Resource;
 use futures::future::BoxFuture;
-use mockall::automock;
 use serde_json::Value;
 use std::fmt;
 use std::sync::Arc;
@@ -152,7 +151,11 @@ impl TransactionOperation {
 }
 
 /// Abstracts database operations via async returns but remains object-safe.
-#[automock]
+///
+/// When built with `--features mock` or for unit tests, `MockDatabaseConnection` is
+/// generated via `mockall`. The attribute must live on this trait — mockall cannot
+/// mock an externally defined trait without duplicating every method.
+#[cfg_attr(any(test, feature = "mock"), mockall::automock)]
 pub trait DatabaseConnection: Send + Sync + std::fmt::Debug {
     /// Returns the name of the field used as the primary key for documents.
     /// The backend must include this field in any full-document results.

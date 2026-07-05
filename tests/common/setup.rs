@@ -1,4 +1,5 @@
 use bevy::prelude::{App, MinimalPlugins};
+use bevy_persistence_database::apply_registered_persist_types;
 use bevy_persistence_database::bevy::plugins::persistence_plugin::PersistencePluginCore;
 #[cfg(feature = "postgres")]
 use bevy_persistence_database::core::db::PostgresDbConnection;
@@ -214,6 +215,7 @@ pub fn setup_test_app(db: Arc<dyn DatabaseConnection>, config: Option<Persistenc
     } else {
         app.add_plugins(PersistencePlugins::new(db));
     }
+    apply_registered_persist_types(&mut app);
     app
 }
 
@@ -418,12 +420,11 @@ pub fn run_async<F: std::future::Future>(fut: F) -> F::Output {
 }
 
 // Convenience to build an App with plugin + config
-pub fn make_app(db: Arc<dyn DatabaseConnection>, batch_size: usize) -> App {
+pub fn make_app(db: Arc<dyn DatabaseConnection>) -> App {
     let config = PersistencePluginConfig {
-        batching_enabled: true,
-        commit_batch_size: batch_size,
         thread_count: 4,
         default_store: TEST_STORE.to_string(),
+        ..Default::default()
     };
     setup_test_app(db, Some(config))
 }

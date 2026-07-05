@@ -7,7 +7,10 @@ use crate::core::db::connection::{
     BEVY_PERSISTENCE_DATABASE_VERSION_FIELD, DocumentKind, EdgeDocument, PersistenceError,
     TransactionOperation, read_kind, read_version,
 };
-use crate::core::db::shared::{GroupedOperations, OperationType, check_operation_success, extract_keys};
+use crate::core::db::shared::{
+    EnsuredStores, GroupedOperations, OperationType, build_arango_edge_bfs_aql,
+    check_operation_success, extract_keys,
+};
 use crate::core::query::{
     BinaryOperator, EdgeQuerySpecification, FilterExpression, PersistenceQuerySpecification,
 };
@@ -20,7 +23,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use once_cell::sync::Lazy;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
@@ -102,9 +105,11 @@ impl ArangoConnectionConfig {
 }
 
 /// A real ArangoDB backend for `DatabaseConnection`.
+#[derive(Clone)]
 pub struct ArangoDbConnection {
     db: Arc<RwLock<Database<ReqwestClient>>>,
     config: ArangoConnectionConfig,
+    ensured: Arc<EnsuredStores>,
 }
 
 impl fmt::Debug for ArangoDbConnection {
@@ -213,7 +218,34 @@ impl ArangoDbConnection {
         Ok(Self {
             db: Arc::new(RwLock::new(db)),
             config,
+            ensured: Arc::new(EnsuredStores::default()),
         })
+    }
+
+    async fn ensure_collection_cached(
+        &self,
+        db: &Database<ReqwestClient>,
+        name: &str,
+    ) -> Result<(), PersistenceError> {
+        if self.ensured.is_ensured(name) {
+            return Ok(());
+        }
+        Self::ensure_collection(db, name).await?;
+        self.ensured.mark_ensured(name);
+        Ok(())
+    }
+
+    async fn ensure_edge_collection_cached(
+        &self,
+        db: &Database<ReqwestClient>,
+        name: &str,
+    ) -> Result<(), PersistenceError> {
+        if self.ensured.is_ensured(name) {
+            return Ok(());
+        }
+        Self::ensure_edge_collection(db, name).await?;
+        self.ensured.mark_ensured(name);
+        Ok(())
     }
 
     async fn ensure_collection(
@@ -375,30 +407,46 @@ impl ArangoDbConnection {
         }
     }
 
-    // Non-async builder used by tests to inspect generated AQL/binds without hitting Arango
-    #[cfg(test)]
-    fn build_query_internal(
+    /// Build the AQL query body for [`DatabaseConnection::execute_documents`].
+    fn build_documents_aql(
         spec: &PersistenceQuerySpecification,
+        filter: &str,
         key_field: &str,
-    ) -> (String, HashMap<String, Value>) {
-        let spec = spec.clone();
-        let mut bind_vars = HashMap::new();
-        insert_store_bind(&mut bind_vars, &spec.store);
-        let filter = Self::build_filter_static(&spec, &mut bind_vars, key_field);
-
-        let aql = if spec.return_full_docs {
+    ) -> String {
+        let meta = BEVY_PERSISTENCE_DATABASE_METADATA_FIELD;
+        if spec.return_full_docs {
             format!(
                 "FOR doc IN @@{}\n  {}\n  RETURN MERGE(doc, {{ \"{}\": doc.`{}` }})",
                 AQL_BIND_STORE, filter, key_field, key_field
             )
+        } else if !spec.fetch_only.is_empty() {
+            let mut merge_parts = vec![
+                format!("{{ \"{}\": doc.`{}` }}", key_field, key_field),
+                format!("{{ \"{}\": doc.`{}` }}", meta, meta),
+            ];
+            for name in &spec.fetch_only {
+                merge_parts.push(format!(
+                    "doc.`{name}` != null ? {{ \"{name}\": doc.`{name}` }} : {{}}",
+                    name = name
+                ));
+            }
+            format!(
+                "FOR doc IN @@{}\n  {}\n  RETURN MERGE({})",
+                AQL_BIND_STORE,
+                filter,
+                merge_parts.join(", ")
+            )
         } else {
             format!(
-                "FOR doc IN @@{}\n  {}\n  RETURN doc.{}",
-                AQL_BIND_STORE, filter, key_field
+                "FOR doc IN @@{}\n  {}\n  RETURN MERGE({{ \"{}\": doc.`{}` }}, {{ \"{}\": doc.`{}` }})",
+                AQL_BIND_STORE,
+                filter,
+                key_field,
+                key_field,
+                meta,
+                meta
             )
-        };
-
-        (aql, bind_vars)
+        }
     }
 
     // Private helper to truncate any collection
@@ -428,11 +476,13 @@ impl ArangoDbConnection {
     ) -> BoxFuture<'static, Result<Option<(Value, u64)>, PersistenceError>> {
         let name = store.to_string();
         let key = key.to_string();
+        let conn = self.clone();
         self.with_reauth(move |db| {
+            let conn = conn.clone();
             let name = name.clone();
             let key = key.clone();
             async move {
-                ArangoDbConnection::ensure_collection(&db, &name).await?;
+                conn.ensure_collection_cached(&db, &name).await?;
                 let col = db
                     .collection(&name)
                     .await
@@ -492,12 +542,14 @@ impl DatabaseConnection for ArangoDbConnection {
             self.document_key_field()
         ));
         let store = spec.store.clone();
+        let conn = self.clone();
         self.with_reauth(move |db| {
+            let conn = conn.clone();
             let aql = aql.clone();
             let store = store.clone();
             let bind_vars = bind_vars.clone();
             async move {
-                ArangoDbConnection::ensure_collection(&db, &store).await?;
+                conn.ensure_collection_cached(&db, &store).await?;
                 let query = AqlQuery::builder()
                     .query(&aql)
                     .bind_vars(
@@ -520,33 +572,20 @@ impl DatabaseConnection for ArangoDbConnection {
         &self,
         spec: &PersistenceQuerySpecification,
     ) -> BoxFuture<'static, Result<Vec<Value>, PersistenceError>> {
-        let mut spec = spec.clone();
-        spec.return_full_docs = true;
+        let spec = spec.clone();
         let mut bind_vars = HashMap::new();
         insert_store_bind(&mut bind_vars, &spec.store);
         let filter = Self::build_filter_static(&spec, &mut bind_vars, self.document_key_field());
-        let mut aql = String::new();
-        if spec.return_full_docs {
-            let kf = self.document_key_field();
-            aql.push_str(&format!(
-                "FOR doc IN @@{}\n  {}\n  RETURN MERGE(doc, {{ \"{}\": doc.`{}` }})",
-                AQL_BIND_STORE, filter, kf, kf
-            ));
-        } else {
-            aql.push_str(&format!(
-                "FOR doc IN @@{}\n  {}\n  RETURN doc.{}",
-                AQL_BIND_STORE,
-                filter,
-                self.document_key_field()
-            ));
-        }
+        let aql = Self::build_documents_aql(&spec, &filter, self.document_key_field());
         let store = spec.store.clone();
+        let conn = self.clone();
         self.with_reauth(move |db| {
+            let conn = conn.clone();
             let aql = aql.clone();
             let store = store.clone();
             let bind_vars = bind_vars.clone();
             async move {
-                ArangoDbConnection::ensure_collection(&db, &store).await?;
+                conn.ensure_collection_cached(&db, &store).await?;
                 let query = AqlQuery::builder()
                     .query(&aql)
                     .bind_vars(
@@ -569,16 +608,11 @@ impl DatabaseConnection for ArangoDbConnection {
         &self,
         spec: &PersistenceQuerySpecification,
     ) -> Result<Vec<Value>, PersistenceError> {
-        let mut spec = spec.clone();
-        spec.return_full_docs = true;
+        let spec = spec.clone();
         let mut bind_vars = HashMap::new();
         insert_store_bind(&mut bind_vars, &spec.store);
         let filter = Self::build_filter_static(&spec, &mut bind_vars, self.document_key_field());
-        let kf = self.document_key_field();
-        let aql = format!(
-            "FOR doc IN @@{}\n  {}\n  RETURN MERGE(doc, {{ \"{}\": doc.`{}` }})",
-            AQL_BIND_STORE, filter, kf, kf
-        );
+        let aql = Self::build_documents_aql(&spec, &filter, self.document_key_field());
         SYNC_RT.block_on(async {
             let db = self
                 .db
@@ -586,7 +620,7 @@ impl DatabaseConnection for ArangoDbConnection {
                 .map(|guard| guard.clone())
                 .map_err(|_| PersistenceError::new("failed to acquire read lock for db"))?;
 
-            ArangoDbConnection::ensure_collection(&db, &spec.store).await?;
+            self.ensure_collection_cached(&db, &spec.store).await?;
             let query = AqlQuery::builder()
                 .query(&aql)
                 .bind_vars(
@@ -620,12 +654,14 @@ impl DatabaseConnection for ArangoDbConnection {
         let key = entity_key.to_string();
         let comp = comp_name.to_string();
         let store_name = store.to_string();
+        let conn = self.clone();
         self.with_reauth(move |db| {
+            let conn = conn.clone();
             let key = key.clone();
             let comp = comp.clone();
             let store_name = store_name.clone();
             async move {
-                ArangoDbConnection::ensure_collection(&db, &store_name).await?;
+                conn.ensure_collection_cached(&db, &store_name).await?;
                 let col = db
                     .collection(&store_name)
                     .await
@@ -676,7 +712,9 @@ impl DatabaseConnection for ArangoDbConnection {
     ) -> BoxFuture<'static, Result<Vec<String>, PersistenceError>> {
         // The DB-level key attribute (e.g., `_key`) for returns
         let _key_attr = self.document_key_field();
+        let conn = self.clone();
         self.with_reauth(move |db| {
+            let conn = conn.clone();
             let operations = operations.clone();
             async move {
                 let store = operations
@@ -694,15 +732,15 @@ impl DatabaseConnection for ArangoDbConnection {
                     ));
                 }
 
-                ArangoDbConnection::ensure_collection(&db, &store).await?;
+                conn.ensure_collection_cached(&db, &store).await?;
 
-                let groups = GroupedOperations::from_operations(operations, JSON_KEY_FIELD);
+                let mut groups = GroupedOperations::from_operations(operations, JSON_KEY_FIELD);
 
                 // If there are edge operations, also ensure the edge collection
                 let edge_collection = format!("{}__edges", store);
                 let has_edge_ops = !groups.edges.upserts.is_empty() || !groups.edges.deletes.is_empty();
                 if has_edge_ops {
-                    ArangoDbConnection::ensure_edge_collection(&db, &edge_collection).await?;
+                    conn.ensure_edge_collection_cached(&db, &edge_collection).await?;
                 }
 
                 let mut write_collections = vec![store.clone()];
@@ -722,6 +760,14 @@ impl DatabaseConnection for ArangoDbConnection {
                     .await
                     .map_err(|e| PersistenceError::new(e.to_string()))?;
 
+                // Run every write inside a scope whose result we inspect, so we
+                // can ABORT the streaming transaction on any error. Without this,
+                // an errored AQL step (e.g. a lock-wait timeout) would drop `trx`
+                // without aborting, leaving the transaction open server-side
+                // holding the collection write lock. That cascades into
+                // "timeout waiting to lock key" on every subsequent commit and
+                // survives client restarts (the transaction lives in the DB).
+                let tx_result: Result<Vec<String>, PersistenceError> = async {
                 let new_keys: Vec<String> = Vec::new();
 
                 // 1) Entity creates
@@ -739,18 +785,18 @@ impl DatabaseConnection for ArangoDbConnection {
                         std::collections::HashMap::new();
                     bind_vars.insert(
                         AQL_BIND_DOCS.into(),
-                        Value::Array(groups.entities.creates.clone()),
+                        Value::Array(std::mem::take(&mut groups.entities.creates)),
                     );
                     insert_store_bind(&mut bind_vars, &store);
                     let query = AqlQuery::builder()
-                        .query(&aql)
-                        .bind_vars(
-                            bind_vars
-                                .iter()
-                                .map(|(k, v)| (k.as_str(), v.clone()))
-                                .collect(),
-                        )
-                        .build();
+                    .query(&aql)
+                    .bind_vars(
+                        bind_vars
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.clone()))
+                            .collect(),
+                    )
+                    .build();
                     let _: Vec<Value> = trx
                         .aql_query(query)
                         .await
@@ -779,7 +825,7 @@ impl DatabaseConnection for ArangoDbConnection {
                         std::collections::HashMap::new();
                     bind_vars.insert(
                         AQL_BIND_PATCHES.into(),
-                        Value::Array(groups.entities.updates.clone()),
+                        Value::Array(std::mem::take(&mut groups.entities.updates)),
                     );
                     bind_vars.insert(
                         AQL_BIND_KIND.into(),
@@ -787,14 +833,14 @@ impl DatabaseConnection for ArangoDbConnection {
                     );
                     insert_store_bind(&mut bind_vars, &store);
                     let query = AqlQuery::builder()
-                        .query(&aql)
-                        .bind_vars(
-                            bind_vars
-                                .iter()
-                                .map(|(k, v)| (k.as_str(), v.clone()))
-                                .collect(),
-                        )
-                        .build();
+                    .query(&aql)
+                    .bind_vars(
+                        bind_vars
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.clone()))
+                            .collect(),
+                    )
+                    .build();
                     let updated: Vec<String> = trx
                         .aql_query(query)
                         .await
@@ -829,7 +875,7 @@ impl DatabaseConnection for ArangoDbConnection {
                         std::collections::HashMap::new();
                     bind_vars.insert(
                         AQL_BIND_DELETES.into(),
-                        Value::Array(groups.entities.deletes.clone()),
+                        Value::Array(std::mem::take(&mut groups.entities.deletes)),
                     );
                     bind_vars.insert(
                         AQL_BIND_KIND.into(),
@@ -837,14 +883,14 @@ impl DatabaseConnection for ArangoDbConnection {
                     );
                     insert_store_bind(&mut bind_vars, &store);
                     let query = AqlQuery::builder()
-                        .query(&aql)
-                        .bind_vars(
-                            bind_vars
-                                .iter()
-                                .map(|(k, v)| (k.as_str(), v.clone()))
-                                .collect(),
-                        )
-                        .build();
+                    .query(&aql)
+                    .bind_vars(
+                        bind_vars
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.clone()))
+                            .collect(),
+                    )
+                    .build();
                     let removed: Vec<String> = trx
                         .aql_query(query)
                         .await
@@ -869,18 +915,18 @@ impl DatabaseConnection for ArangoDbConnection {
                         std::collections::HashMap::new();
                     bind_vars.insert(
                         AQL_BIND_DOCS.into(),
-                        Value::Array(groups.resources.creates.clone()),
+                        Value::Array(std::mem::take(&mut groups.resources.creates)),
                     );
                     insert_store_bind(&mut bind_vars, &store);
                     let query = AqlQuery::builder()
-                        .query(&aql)
-                        .bind_vars(
-                            bind_vars
-                                .iter()
-                                .map(|(k, v)| (k.as_str(), v.clone()))
-                                .collect(),
-                        )
-                        .build();
+                    .query(&aql)
+                    .bind_vars(
+                        bind_vars
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.clone()))
+                            .collect(),
+                    )
+                    .build();
                     let _: Vec<Value> = trx
                         .aql_query(query)
                         .await
@@ -909,7 +955,7 @@ impl DatabaseConnection for ArangoDbConnection {
                         std::collections::HashMap::new();
                     bind_vars.insert(
                         AQL_BIND_PATCHES.into(),
-                        Value::Array(groups.resources.updates.clone()),
+                        Value::Array(std::mem::take(&mut groups.resources.updates)),
                     );
                     bind_vars.insert(
                         AQL_BIND_KIND.into(),
@@ -917,14 +963,14 @@ impl DatabaseConnection for ArangoDbConnection {
                     );
                     insert_store_bind(&mut bind_vars, &store);
                     let query = AqlQuery::builder()
-                        .query(&aql)
-                        .bind_vars(
-                            bind_vars
-                                .iter()
-                                .map(|(k, v)| (k.as_str(), v.clone()))
-                                .collect(),
-                        )
-                        .build();
+                    .query(&aql)
+                    .bind_vars(
+                        bind_vars
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.clone()))
+                            .collect(),
+                    )
+                    .build();
                     let updated: Vec<String> = trx
                         .aql_query(query)
                         .await
@@ -959,7 +1005,7 @@ impl DatabaseConnection for ArangoDbConnection {
                         std::collections::HashMap::new();
                     bind_vars.insert(
                         AQL_BIND_DELETES.into(),
-                        Value::Array(groups.resources.deletes.clone()),
+                        Value::Array(std::mem::take(&mut groups.resources.deletes)),
                     );
                     bind_vars.insert(
                         AQL_BIND_KIND.into(),
@@ -967,14 +1013,14 @@ impl DatabaseConnection for ArangoDbConnection {
                     );
                     insert_store_bind(&mut bind_vars, &store);
                     let query = AqlQuery::builder()
-                        .query(&aql)
-                        .bind_vars(
-                            bind_vars
-                                .iter()
-                                .map(|(k, v)| (k.as_str(), v.clone()))
-                                .collect(),
-                        )
-                        .build();
+                    .query(&aql)
+                    .bind_vars(
+                        bind_vars
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.clone()))
+                            .collect(),
+                    )
+                    .build();
                     let removed: Vec<String> = trx
                         .aql_query(query)
                         .await
@@ -1015,14 +1061,14 @@ impl DatabaseConnection for ArangoDbConnection {
                         Value::String(edge_collection.clone()),
                     );
                     let query = AqlQuery::builder()
-                        .query(&aql)
-                        .bind_vars(
-                            bind_vars
-                                .iter()
-                                .map(|(k, v)| (k.as_str(), v.clone()))
-                                .collect(),
-                        )
-                        .build();
+                    .query(&aql)
+                    .bind_vars(
+                        bind_vars
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.clone()))
+                            .collect(),
+                    )
+                    .build();
                     let _: Vec<Value> = trx
                         .aql_query(query)
                         .await
@@ -1046,14 +1092,14 @@ impl DatabaseConnection for ArangoDbConnection {
                         Value::String(edge_collection.clone()),
                     );
                     let query = AqlQuery::builder()
-                        .query(&aql)
-                        .bind_vars(
-                            bind_vars
-                                .iter()
-                                .map(|(k, v)| (k.as_str(), v.clone()))
-                                .collect(),
-                        )
-                        .build();
+                    .query(&aql)
+                    .bind_vars(
+                        bind_vars
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.clone()))
+                            .collect(),
+                    )
+                    .build();
                     let _: Vec<Value> = trx
                         .aql_query(query)
                         .await
@@ -1064,6 +1110,23 @@ impl DatabaseConnection for ArangoDbConnection {
                     .await
                     .map_err(|e| PersistenceError::new(e.to_string()))?;
                 Ok(new_keys)
+                }
+                .await;
+
+                match tx_result {
+                    Ok(keys) => Ok(keys),
+                    Err(err) => {
+                        // Best-effort abort so a failed commit never leaves the
+                        // streaming transaction open holding a lock.
+                        if let Err(abort_err) = trx.abort().await {
+                            bevy::log::warn!(
+                                "failed to abort streaming transaction after commit error; \
+                                 it may leak and hold a collection lock: {abort_err}"
+                            );
+                        }
+                        Err(err)
+                    }
+                }
             }
         })
     }
@@ -1084,12 +1147,14 @@ impl DatabaseConnection for ArangoDbConnection {
 
         bevy::log::debug!("[arango] count_documents AQL: {}", count_aql);
 
+        let conn = self.clone();
         self.with_reauth(move |db| {
+            let conn = conn.clone();
             let store = store.clone();
             let count_aql = count_aql.clone();
             let bind_vars = bind_vars.clone();
             async move {
-                ArangoDbConnection::ensure_collection(&db, &store).await?;
+                conn.ensure_collection_cached(&db, &store).await?;
                 let query = AqlQuery::builder()
                     .query(&count_aql)
                     .bind_vars(
@@ -1115,7 +1180,9 @@ impl DatabaseConnection for ArangoDbConnection {
         spec: &EdgeQuerySpecification,
     ) -> BoxFuture<'static, Result<Vec<EdgeDocument>, PersistenceError>> {
         let spec = spec.clone();
+        let conn = self.clone();
         self.with_reauth(move |db| {
+            let conn = conn.clone();
             let spec = spec.clone();
             async move {
                 if spec.store.is_empty() || spec.depth == 0 {
@@ -1123,7 +1190,7 @@ impl DatabaseConnection for ArangoDbConnection {
                 }
 
                 let edge_collection = format!("{}__edges", spec.store);
-                ArangoDbConnection::ensure_edge_collection(&db, &edge_collection).await?;
+                conn.ensure_edge_collection_cached(&db, &edge_collection).await?;
 
                 if spec.from_guids.is_empty() {
                     let aql = "FOR e IN @@col
@@ -1165,67 +1232,42 @@ impl DatabaseConnection for ArangoDbConnection {
                     return Ok(edges);
                 }
 
-                let mut all_edges: Vec<EdgeDocument> = Vec::new();
-                let mut seen_keys: HashSet<String> = HashSet::new();
-                let mut frontier: Vec<String> = spec.from_guids.clone();
+                let aql = build_arango_edge_bfs_aql(spec.depth);
+                let mut bind_vars: HashMap<String, Value> = HashMap::new();
+                bind_vars.insert("@col".into(), Value::String(edge_collection));
+                bind_vars.insert(
+                    "types".into(),
+                    Value::Array(
+                        spec.relationship_types
+                            .iter()
+                            .cloned()
+                            .map(Value::String)
+                            .collect(),
+                    ),
+                );
+                bind_vars.insert(
+                    "from_guids".into(),
+                    Value::Array(spec.from_guids.iter().cloned().map(Value::String).collect()),
+                );
+                bind_vars.insert(
+                    "to_guids".into(),
+                    Value::Array(spec.to_guids.iter().cloned().map(Value::String).collect()),
+                );
 
-                for _ in 0..spec.depth {
-                    if frontier.is_empty() {
-                        break;
-                    }
-
-                    let aql = "FOR e IN @@col
-  FILTER LENGTH(@types) == 0 OR e.relationship_type IN @types
-  FILTER e.from_guid IN @from_guids
-  FILTER LENGTH(@to_guids) == 0 OR e.to_guid IN @to_guids
-  RETURN { key: e._key, relationship_type: e.relationship_type, from_guid: e.from_guid, to_guid: e.to_guid, payload: e.payload }";
-
-                    let mut bind_vars: HashMap<String, Value> = HashMap::new();
-                    bind_vars.insert("@col".into(), Value::String(edge_collection.clone()));
-                    bind_vars.insert(
-                        "types".into(),
-                        Value::Array(
-                            spec.relationship_types
-                                .iter()
-                                .cloned()
-                                .map(Value::String)
-                                .collect(),
-                        ),
-                    );
-                    bind_vars.insert(
-                        "from_guids".into(),
-                        Value::Array(frontier.iter().cloned().map(Value::String).collect()),
-                    );
-                    bind_vars.insert(
-                        "to_guids".into(),
-                        Value::Array(spec.to_guids.iter().cloned().map(Value::String).collect()),
-                    );
-
-                    let query = AqlQuery::builder()
-                        .query(aql)
-                        .bind_vars(
-                            bind_vars
-                                .iter()
-                                .map(|(k, v)| (k.as_str(), v.clone()))
-                                .collect(),
-                        )
-                        .build();
-
-                    let edges: Vec<EdgeDocument> = db
-                        .aql_query(query)
-                        .await
-                        .map_err(|e| PersistenceError::new(e.to_string()))?;
-                    let mut next_frontier = Vec::new();
-                    for edge in edges {
-                        if seen_keys.insert(edge.key.clone()) {
-                            next_frontier.push(edge.to_guid.clone());
-                            all_edges.push(edge);
-                        }
-                    }
-                    frontier = next_frontier;
-                }
-
-                Ok(all_edges)
+                let query = AqlQuery::builder()
+                    .query(&aql)
+                    .bind_vars(
+                        bind_vars
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.clone()))
+                            .collect(),
+                    )
+                    .build();
+                let edges: Vec<EdgeDocument> = db
+                    .aql_query(query)
+                    .await
+                    .map_err(|e| PersistenceError::new(e.to_string()))?;
+                Ok(edges)
             }
         })
     }
@@ -1238,21 +1280,28 @@ mod tests {
     use serde_json::Value;
     use std::collections::HashMap;
 
-    /// Helper to call the private builder without touching `db`.
+    /// Build AQL + bind vars for a spec without connecting to Arango.
     fn build(spec: PersistenceQuerySpecification) -> (String, HashMap<String, Value>) {
-        ArangoDbConnection::build_query_internal(&spec, "_key")
+        let key_field = "_key";
+        let mut bind_vars = HashMap::new();
+        insert_store_bind(&mut bind_vars, &spec.store);
+        let filter = ArangoDbConnection::build_filter_static(&spec, &mut bind_vars, key_field);
+        let aql = ArangoDbConnection::build_documents_aql(&spec, &filter, key_field);
+        (aql, bind_vars)
     }
 
     #[test]
     fn presence_only_filters_and_keys() {
         let mut spec = PersistenceQuerySpecification::default();
         spec.presence_with = vec!["Health"];
+        spec.fetch_only = vec!["Health"];
         spec.return_full_docs = false;
         let (aql, binds) = build(spec);
 
         assert!(aql.contains("FOR doc IN @@store"));
         assert!(aql.contains("bevy_persistence_database_metadata"));
-        assert!(aql.contains("RETURN doc._key"));
+        assert!(aql.contains("doc.`Health`"));
+        assert!(aql.contains("RETURN MERGE("));
         assert_eq!(binds.len(), 2, "expect store and kind binds only");
     }
 
@@ -1294,13 +1343,23 @@ mod tests {
     fn return_full_docs_merges_doc_and_key() {
         let mut spec = PersistenceQuerySpecification::default();
         spec.return_full_docs = true;
-        // no presence/value filters -> FILTER true
         let (aql, binds) = build(spec);
 
         assert!(aql.contains("bevy_persistence_database_metadata"));
-        // check MERGE(doc, { "_key": doc.`_key` })
         assert!(aql.contains("RETURN MERGE(doc,"));
         assert!(aql.contains("\"_key\": doc.`_key`"));
         assert_eq!(binds.len(), 2, "store and kind");
+    }
+
+    #[test]
+    fn partial_projection_includes_only_fetch_only_fields() {
+        let mut spec = PersistenceQuerySpecification::default();
+        spec.fetch_only = vec!["Health", "Position"];
+        spec.return_full_docs = false;
+        let (aql, _) = build(spec);
+
+        assert!(aql.contains("doc.`Health`"));
+        assert!(aql.contains("doc.`Position`"));
+        assert!(!aql.contains("RETURN MERGE(doc,"));
     }
 }

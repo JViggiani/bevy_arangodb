@@ -1,11 +1,13 @@
 //! Core ECS‐to‐Arango bridge: defines `PersistenceSession`.
 //! Handles local cache, change tracking, and commit logic (create/update/delete).
 
+use crate::bevy::components::Guid;
 use crate::core::db::connection::{
     BEVY_PERSISTENCE_DATABASE_BEVY_TYPE_FIELD, BEVY_PERSISTENCE_DATABASE_METADATA_FIELD,
-    BEVY_PERSISTENCE_DATABASE_VERSION_FIELD, DatabaseConnection, DocumentKind, PersistenceError,
-    TransactionOperation,
+    BEVY_PERSISTENCE_DATABASE_VERSION_FIELD, DatabaseConnection, DocumentKind, PersistenceError, TransactionOperation,
 };
+use crate::core::db::read_version;
+use crate::core::db::shared::edge_source_guid;
 use crate::core::persist::Persist;
 use crate::core::versioning::version_manager::{VersionKey, VersionManager};
 use bevy::prelude::{Component, Entity, Resource, World, debug};
@@ -36,7 +38,12 @@ type ResourceRemover = Box<dyn Fn(&mut World) + Send + Sync>;
 /// current commit (not yet in the session's entity-key cache); it enables entity + relationship
 /// to be persisted in a single commit.
 type RelationshipSerializer = Box<
-    dyn Fn(&World, &PersistenceSession, &HashMap<Entity, String>) -> Result<Vec<crate::core::db::connection::EdgeDocument>, PersistenceError>
+    dyn Fn(
+            &World,
+            &PersistenceSession,
+            &HashMap<Entity, String>,
+            &HashSet<Entity>,
+        ) -> Result<Vec<crate::core::db::connection::EdgeDocument>, PersistenceError>
         + Send
         + Sync,
 >;
@@ -176,6 +183,13 @@ pub struct PersistenceSession {
     resources: ResourceRegistry,
     relationships: RelationshipRegistry,
     cache: PersistenceCache,
+    /// Non-zero while persisted state is being hydrated into the world.
+    ///
+    /// Opened automatically by [`Self::materialize_entity_document`],
+    /// [`Self::materialize_resource`], and [`Self::apply_relationship_targets`]. Closed by
+    /// [`Self::finish_all_hydration`] in PostUpdate after dirty tracking. While depth is
+    /// non-zero, ECS change-detection entry points suppress spurious dirty flags.
+    hydration_depth: u32,
 }
 
 pub(crate) struct CommitData {
@@ -185,6 +199,11 @@ pub(crate) struct CommitData {
     pub(crate) new_edge_snapshot: HashSet<String>,
     /// Client-side preassigned keys for new entities.
     pub(crate) preassigned_keys: HashMap<Entity, String>,
+    /// Dirty sets scoped to entities/resources that actually produced DB operations.
+    pub(crate) committed_entity_components: HashMap<Entity, HashSet<TypeId>>,
+    pub(crate) committed_despawned_entities: HashSet<Entity>,
+    pub(crate) committed_dirty_resources: HashSet<TypeId>,
+    pub(crate) committed_despawned_resources: HashSet<TypeId>,
 }
 
 impl PersistenceSession {
@@ -319,6 +338,9 @@ impl PersistenceSession {
     }
 
     /// Mark a specific persisted component type as dirty for an entity.
+    ///
+    /// Prefer [`Self::track_component_added`] / [`Self::track_component_changed`] from
+    /// ECS change-detection systems so hydration suppression stays centralized.
     pub(crate) fn mark_entity_component_dirty(&mut self, entity: Entity, component: TypeId) {
         self.tracking
             .dirty_entity_components
@@ -327,9 +349,49 @@ impl PersistenceSession {
             .insert(component);
     }
 
+    /// Record ECS `Added<T>` for dirty tracking. No-op while hydrating.
+    pub(crate) fn track_component_added(&mut self, entity: Entity, component: TypeId) {
+        if self.is_hydrating() {
+            return;
+        }
+        self.mark_entity_component_dirty(entity, component);
+    }
+
+    /// Record ECS `Changed<T>` for dirty tracking.
+    ///
+    /// Load inserts that also appear as `Added` in the same frame are suppressed while
+    /// hydrating; genuine post-load edits on existing components still mark dirty.
+    pub(crate) fn track_component_changed(
+        &mut self,
+        entity: Entity,
+        component: TypeId,
+        also_added_this_frame: bool,
+    ) {
+        if self.is_hydrating() && also_added_this_frame {
+            return;
+        }
+        self.mark_entity_component_dirty(entity, component);
+    }
+
+    /// Record ECS resource change detection. No-op while hydrating.
+    pub(crate) fn track_resource_changed(&mut self, type_id: TypeId) {
+        if self.is_hydrating() {
+            return;
+        }
+        self.tracking.dirty_resources.insert(type_id);
+    }
+
     /// Mark an entity's relationships as dirty.
     pub(crate) fn mark_relationship_entity_dirty(&mut self, entity: Entity) {
         self.tracking.dirty_relationship_entities.insert(entity);
+    }
+
+    /// Record ECS relationship change detection. No-op while hydrating.
+    pub(crate) fn track_relationship_entity_changed(&mut self, entity: Entity) {
+        if self.is_hydrating() {
+            return;
+        }
+        self.mark_relationship_entity_dirty(entity);
     }
 
     /// Register a relationship type for edge persistence.
@@ -352,7 +414,6 @@ impl PersistenceSession {
     /// This iterates all entities that have `R` and a cached GUID, extracting
     /// each relationship target to build `EdgeDocument`s. Disabled when the
     /// `bevy_many_relationship_edges` feature is enabled.
-    #[allow(deprecated)]
     #[cfg(not(feature = "bevy_many_relationship_edges"))]
     pub fn register_bevy_relationship<R: Component + bevy::ecs::relationship::Relationship>(
         &mut self,
@@ -363,11 +424,12 @@ impl PersistenceSession {
         self.register_relationship(
             type_id,
             name,
-            Box::new(move |world, session, preassigned: &HashMap<Entity, String>| {
+            Box::new(move |world, session, preassigned: &HashMap<Entity, String>, scan_sources: &HashSet<Entity>| {
                 let mut edges = Vec::new();
-                #[allow(deprecated)]
-                for entity_ref in world.iter_entities() {
-                    let from_entity = entity_ref.id();
+                for &from_entity in scan_sources {
+                    let Ok(entity_ref) = world.get_entity(from_entity) else {
+                        continue;
+                    };
                     if let Some(rel) = entity_ref.get::<R>() {
                         let target = rel.get();
                         let from_guid = session
@@ -427,7 +489,6 @@ impl PersistenceSession {
     /// cached GUID, extracting each outgoing edge (with optional serialised
     /// payload) to build `EdgeDocument`s. Only available when the
     /// `bevy_many_relationship_edges` feature is enabled.
-    #[allow(deprecated)]
     #[cfg(feature = "bevy_many_relationship_edges")]
     pub fn register_many_relationship<R: serde::Serialize + DeserializeOwned + Send + Sync + 'static>(
         &mut self,
@@ -438,11 +499,12 @@ impl PersistenceSession {
         self.register_relationship(
             type_id,
             name,
-            Box::new(move |world, session, preassigned: &HashMap<Entity, String>| {
+            Box::new(move |world, session, preassigned: &HashMap<Entity, String>, scan_sources: &HashSet<Entity>| {
                 let mut edges = Vec::new();
-                #[allow(deprecated)]
-                for entity_ref in world.iter_entities() {
-                    let from_entity = entity_ref.id();
+                for &from_entity in scan_sources {
+                    let Ok(entity_ref) = world.get_entity(from_entity) else {
+                        continue;
+                    };
                     if let Some(outgoing) =
                         entity_ref.get::<bevy_many_relationships::OutgoingRelationships<R>>()
                     {
@@ -479,7 +541,7 @@ impl PersistenceSession {
             type_id,
             Box::new(|world, source_entity, targets| {
                 if let Some(existing) = world.get::<bevy_many_relationships::OutgoingRelationships<R>>(source_entity) {
-                    let existing_targets: Vec<Entity> = existing.targets().copied().collect();
+                    let existing_targets: Vec<Entity> = existing.targets().collect();
                     for target in existing_targets {
                         bevy_many_relationships::remove_many_relationship::<R>(world, source_entity, target);
                     }
@@ -527,6 +589,10 @@ impl PersistenceSession {
         self.resources.serializers.keys().copied()
     }
 
+    pub(crate) fn resource_name_for_type(&self, type_id: TypeId) -> Option<&'static str> {
+        self.resources.type_id_to_name.get(&type_id).copied()
+    }
+
     /// Returns the number of registered persisted resources.
     pub fn persisted_resource_count(&self) -> usize {
         self.resources.removers.len()
@@ -540,20 +606,17 @@ impl PersistenceSession {
         }
     }
 
-    /// Run the registered resource deserializer for a given persisted resource name.
+    /// Deserialize one persisted resource during load (no version cache update).
+    ///
+    /// Prefer [`Self::materialize_resource`] for values read from the database;
+    /// this is for manual or test application of a JSON blob.
     pub fn deserialize_resource_by_name(
-        &self,
+        &mut self,
         world: &mut World,
         name: &str,
         value: Value,
     ) -> Result<(), PersistenceError> {
-        if let Some(deser) = self.resources.deserializers.get(name) {
-            deser(world, value)
-        } else {
-            Err(PersistenceError::new(format!(
-                "no deserializer registered for resource {name}"
-            )))
-        }
+        self.hydrate_resource(world, name, value)
     }
 
     /// Manually mark an entity as having been removed.
@@ -648,34 +711,17 @@ impl PersistenceSession {
     }
 
     pub(crate) fn apply_relationship_targets(
-        &self,
+        &mut self,
         type_id: TypeId,
         world: &mut World,
         source: Entity,
         targets: Vec<(Entity, Option<Value>)>,
     ) -> Result<(), PersistenceError> {
+        self.ensure_hydrating();
         if let Some(deserializer) = self.relationships.deserializers.get(&type_id) {
             deserializer(world, source, targets)?;
         }
         Ok(())
-    }
-
-    pub(crate) fn component_deserializer(
-        &self,
-        name: &str,
-    ) -> Option<&ComponentDeserializer> {
-        self.components.deserializers.get(name)
-    }
-
-    pub(crate) fn component_deserializers(
-        &self,
-    ) -> impl Iterator<Item = (&String, &ComponentDeserializer)> {
-        self.components.deserializers.iter()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn resource_deserializer(&self, name: &str) -> Option<&ResourceDeserializer> {
-        self.resources.deserializers.get(name)
     }
 
     #[cfg(test)]
@@ -717,7 +763,212 @@ impl PersistenceSession {
             resources: ResourceRegistry::default(),
             relationships: RelationshipRegistry::default(),
             cache: PersistenceCache::default(),
+            hydration_depth: 0,
         }
+    }
+
+    /// Whether a hydration scope is currently active.
+    pub(crate) fn is_hydrating(&self) -> bool {
+        self.hydration_depth > 0
+    }
+
+    /// Open a hydration scope if one is not already active.
+    fn ensure_hydrating(&mut self) {
+        if self.hydration_depth == 0 {
+            self.hydration_depth = 1;
+        }
+    }
+
+    /// Close all hydration scopes opened during load this frame.
+    pub(crate) fn finish_all_hydration(&mut self) {
+        self.hydration_depth = 0;
+    }
+
+    /// Deserialize one persisted entity component during load.
+    ///
+    /// Prefer [`Self::hydrate_entity_document`] when applying a stored entity document;
+    /// this method is for single-component sources (e.g. per-field DB fetches).
+    pub(crate) fn hydrate_entity_component(
+        &mut self,
+        world: &mut World,
+        entity: Entity,
+        comp_name: &str,
+        value: Value,
+    ) -> Result<(), PersistenceError> {
+        self.ensure_hydrating();
+        let Some(deser) = self.components.deserializers.get(comp_name) else {
+            return Ok(());
+        };
+        deser(world, entity, value)
+    }
+
+    /// Deserialize one persisted resource during load.
+    fn hydrate_resource(
+        &mut self,
+        world: &mut World,
+        res_name: &str,
+        value: Value,
+    ) -> Result<(), PersistenceError> {
+        self.ensure_hydrating();
+        let Some(deser) = self.resources.deserializers.get(res_name) else {
+            return Ok(());
+        };
+        deser(world, value)
+    }
+
+    fn cache_resource_version(&mut self, res_name: &str, version: u64) {
+        if let Some(type_id) = self.resources.name_to_type_id.get(res_name) {
+            self.cache
+                .version_manager
+                .set_version(VersionKey::Resource(*type_id), version);
+        }
+    }
+
+    /// Apply one fetched persisted resource during load (version cache + deserializer).
+    fn hydrate_fetched_resource(
+        &mut self,
+        world: &mut World,
+        res_name: &str,
+        value: Value,
+        version: u64,
+    ) -> Result<(), PersistenceError> {
+        self.cache_resource_version(res_name, version);
+        self.hydrate_resource(world, res_name, value)
+    }
+
+    /// Load one persisted resource from the database into the world.
+    ///
+    /// Single entry point for resource loads: fetch, cache version, open hydration scope,
+    /// and deserialize. Returns `Ok(true)` when a value was found and applied, `Ok(false)`
+    /// when the resource is absent in the store.
+    pub async fn materialize_resource(
+        &mut self,
+        db: &(dyn DatabaseConnection + 'static),
+        store: &str,
+        world: &mut World,
+        res_name: &str,
+    ) -> Result<bool, PersistenceError> {
+        if let Some((val, version)) = db.fetch_resource(store, res_name).await? {
+            self.hydrate_fetched_resource(world, res_name, val, version)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Deserialize persisted entity components from a stored document during load.
+    ///
+    /// Prefer [`Self::materialize_entity_document`] for full document loads so entity
+    /// resolution and version caching stay centralized. This lower-level helper assumes
+    /// the caller has already resolved the target entity.
+    pub(crate) fn hydrate_entity_document(
+        &mut self,
+        world: &mut World,
+        entity: Entity,
+        doc: &Value,
+        component_names: &[&str],
+    ) -> Result<(), PersistenceError> {
+        self.ensure_hydrating();
+        if !component_names.is_empty() {
+            for &comp_name in component_names {
+                if let Some(val) = doc.get(comp_name) {
+                    self.hydrate_entity_component(world, entity, comp_name, val.clone())?;
+                }
+            }
+        } else {
+            let names: Vec<String> = self.components.deserializers.keys().cloned().collect();
+            for name in names {
+                if let Some(val) = doc.get(&name) {
+                    self.hydrate_entity_component(world, entity, &name, val.clone())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve or spawn the persisted entity for `key`, including entities that already
+    /// carry a matching [`Guid`] but are not yet indexed in the session cache.
+    fn resolve_or_spawn_entity_for_key(&mut self, world: &mut World, key: &str) -> (Entity, bool) {
+        if let Some(existing) = self
+            .entity_by_key(key)
+            .filter(|entity| world.get_entity(*entity).is_ok())
+        {
+            return (existing, true);
+        }
+
+        for (entity, guid) in world.query::<(Entity, &Guid)>().iter(world) {
+            if guid.id() == key {
+                self.insert_entity_key(entity, key.to_string());
+                return (entity, true);
+            }
+        }
+
+        if let Some(existing) = self
+            .entity_keys()
+            .iter()
+            .find(|(_, cached_key)| cached_key.as_str() == key)
+            .map(|(entity, _)| *entity)
+        {
+            if world.get_entity(existing).is_ok() {
+                if !self.entity_keys().contains_key(&existing) {
+                    self.insert_entity_key(existing, key.to_string());
+                }
+                return (existing, true);
+            }
+        }
+
+        let entity = world.spawn(Guid::new(key.to_string())).id();
+        self.insert_entity_key(entity, key.to_string());
+        (entity, false)
+    }
+
+    /// Load one persisted entity document into the world.
+    ///
+    /// This is the single entry point for entity document loads: resolve/spawn entity,
+    /// cache version, open hydration scope, and deserialize registered components.
+    /// When `component_names` is empty, every registered component field present in `doc`
+    /// is hydrated.
+    pub(crate) fn materialize_entity_document(
+        &mut self,
+        world: &mut World,
+        doc: &Value,
+        key_field: &str,
+        component_names: &[&str],
+        allow_overwrite: bool,
+    ) -> Result<Option<Entity>, PersistenceError> {
+        let Some(key) = doc.get(key_field).and_then(|v| v.as_str()) else {
+            return Ok(None);
+        };
+        let key = key.to_string();
+        let (entity, existed) = self.resolve_or_spawn_entity_for_key(world, &key);
+        if existed && !allow_overwrite {
+            return Ok(Some(entity));
+        }
+
+        let version = read_version(doc).unwrap_or(1);
+        self.cache
+            .version_manager
+            .set_version(VersionKey::Entity(key), version);
+        self.hydrate_entity_document(world, entity, doc, component_names)?;
+        Ok(Some(entity))
+    }
+
+    /// Like [`Self::materialize_entity_document`] when the key is known separately from
+    /// the stored payload (for example relationship target fetches).
+    pub(crate) fn materialize_entity_document_for_key(
+        &mut self,
+        world: &mut World,
+        key: &str,
+        mut doc: Value,
+        key_field: &str,
+        component_names: &[&str],
+    ) -> Result<Option<Entity>, PersistenceError> {
+        if doc.get(key_field).is_none() {
+            if let Some(map) = doc.as_object_mut() {
+                map.insert(key_field.to_string(), Value::String(key.to_string()));
+            }
+        }
+        self.materialize_entity_document(world, &doc, key_field, component_names, true)
     }
 
     /// Fetch the document for the given key from `db` and deserialize its components
@@ -732,19 +983,11 @@ impl PersistenceSession {
         component_names: &[&'static str],
     ) -> Result<(), PersistenceError> {
         if let Some((doc, version)) = db.fetch_document(store, key).await? {
-            // Cache the version
             self.cache
                 .version_manager
                 .set_version(VersionKey::Entity(key.to_string()), version);
 
-            // Deserialize requested components
-            for &comp_name in component_names {
-                if let Some(val) = doc.get(comp_name) {
-                    if let Some(deser) = self.components.deserializers.get(comp_name) {
-                        deser(world, entity, val.clone())?;
-                    }
-                }
-            }
+            self.hydrate_entity_document(world, entity, &doc, component_names)?;
         }
         Ok(())
     }
@@ -757,16 +1000,16 @@ impl PersistenceSession {
         store: &str,
         world: &mut World,
     ) -> Result<(), PersistenceError> {
-        for (res_name, deser) in self.resources.deserializers.iter() {
-            if let Some((val, version)) = db.fetch_resource(store, res_name).await? {
-                // Cache the version based on the resource's TypeId using the map.
-                if let Some(type_id) = self.resources.name_to_type_id.get(res_name) {
-                    self.cache
-                        .version_manager
-                        .set_version(VersionKey::Resource(*type_id), version);
-                }
-                deser(world, val)?;
-            }
+        let res_names: Vec<String> = self
+            .resources
+            .deserializers
+            .keys()
+            .cloned()
+            .collect();
+        self.ensure_hydrating();
+        for res_name in res_names {
+            self.materialize_resource(db, store, world, &res_name)
+                .await?;
         }
         Ok(())
     }
@@ -774,7 +1017,7 @@ impl PersistenceSession {
     /// Fetch each named component from `db` for the given document `key` and
     /// run the registered deserializer to insert it into `world` for `entity`.
     pub async fn fetch_and_insert_components(
-        &self,
+        &mut self,
         db: &(dyn DatabaseConnection + 'static),
         store: &str,
         world: &mut World,
@@ -784,9 +1027,7 @@ impl PersistenceSession {
     ) -> Result<(), PersistenceError> {
         for &comp_name in component_names {
             if let Some(val) = db.fetch_component(store, key, comp_name).await? {
-                if let Some(deser) = self.components.deserializers.get(comp_name) {
-                    deser(world, entity, val)?;
-                }
+                self.hydrate_entity_component(world, entity, comp_name, val)?;
             }
         }
         Ok(())
@@ -814,6 +1055,10 @@ impl PersistenceSession {
             return Err(PersistenceError::new("store must be provided for commit"));
         }
         let mut operations = Vec::new();
+        let mut committed_entity_components: HashMap<Entity, HashSet<TypeId>> = HashMap::new();
+        let mut committed_despawned_entities: HashSet<Entity> = HashSet::new();
+        let mut committed_dirty_resources: HashSet<TypeId> = HashSet::new();
+        let mut committed_despawned_resources: HashSet<TypeId> = HashSet::new();
 
         // Pre-compute client-side GUIDs for new entities.
         // Entities in dirty_entity_components that don't have a cached key need one.
@@ -821,7 +1066,7 @@ impl PersistenceSession {
         for &entity in dirty_entity_components.keys() {
             if session.cache.entity_keys.get(&entity).is_none() {
                 // Check if the entity already has a Guid component
-                let guid = world.get::<crate::bevy::components::Guid>(entity);
+                let guid = world.get::<Guid>(entity);
                 let key = if let Some(guid) = guid {
                     guid.id().to_string()
                 } else {
@@ -856,10 +1101,11 @@ impl PersistenceSession {
                     .ok_or_else(|| PersistenceError::new("Missing version for deletion"))?;
                 operations.push(TransactionOperation::DeleteDocument {
                     store: store.to_string(),
-                    kind: crate::core::db::connection::DocumentKind::Entity,
+                    kind: DocumentKind::Entity,
                     key: key.clone(),
                     expected_current_version: current_version,
                 });
+                committed_despawned_entities.insert(entity);
             }
         }
 
@@ -873,14 +1119,16 @@ impl PersistenceSession {
             };
             operations.push(TransactionOperation::DeleteDocument {
                 store: store.to_string(),
-                kind: crate::core::db::connection::DocumentKind::Resource,
+                kind: DocumentKind::Resource,
                 key: name.to_string(),
                 expected_current_version: current_version,
             });
+            committed_despawned_resources.insert(resource_type_id);
         }
 
         let serialize_entity = |(&entity, dirty_components): (&Entity, &HashSet<TypeId>)| {
                 let mut data_map = serde_json::Map::new();
+                let mut committed_types = HashSet::new();
 
                 let component_type_ids: Vec<TypeId> =
                     dirty_components.iter().copied().collect();
@@ -895,6 +1143,7 @@ impl PersistenceSession {
                     };
                     if let Some((field_name, value)) = serializer(entity, world)? {
                         data_map.insert(field_name, value);
+                        committed_types.insert(component_type_id);
                     }
                 }
                 if data_map.is_empty() {
@@ -918,7 +1167,8 @@ impl PersistenceSession {
                             expected_current_version: current_version,
                             patch: Value::Object(data_map),
                         },
-                        None,
+                        entity,
+                        committed_types,
                     )))
                 } else if let Some(key) = preassigned_keys.get(&entity) {
                     // create new document with client-side GUID
@@ -931,7 +1181,8 @@ impl PersistenceSession {
                             kind: DocumentKind::Entity,
                             data: document,
                         },
-                        Some(entity),
+                        entity,
+                        committed_types,
                     )))
                 } else {
                     Err(PersistenceError::new(format!(
@@ -948,24 +1199,29 @@ impl PersistenceSession {
                     .par_iter()
                     .map(&serialize_entity)
                     .filter_map(|res| res.transpose())
-                    .collect::<Result<Vec<(TransactionOperation, Option<Entity>)>, PersistenceError>>()
+                    .collect::<Result<Vec<(TransactionOperation, Entity, HashSet<TypeId>)>, PersistenceError>>()
             })
         } else {
             dirty_entity_components
                 .iter()
                 .map(&serialize_entity)
                 .filter_map(|res| res.transpose())
-                .collect::<Result<Vec<(TransactionOperation, Option<Entity>)>, PersistenceError>>()
+                .collect::<Result<Vec<(TransactionOperation, Entity, HashSet<TypeId>)>, PersistenceError>>()
         };
 
-        let (entity_ops, created): (Vec<TransactionOperation>, Vec<Option<Entity>>) =
-            match entity_ops_result {
-                Ok(ops_and_entities) => ops_and_entities.into_iter().unzip(),
-                Err(e) => return Err(e),
-            };
-
-        operations.extend(entity_ops);
-        let newly_created_entities: Vec<Entity> = created.into_iter().flatten().collect();
+        let mut newly_created_entities = Vec::new();
+        match entity_ops_result {
+            Ok(ops_and_entities) => {
+                for (op, entity, committed_types) in ops_and_entities {
+                    if preassigned_keys.contains_key(&entity) {
+                        newly_created_entities.push(entity);
+                    }
+                    committed_entity_components.insert(entity, committed_types);
+                    operations.push(op);
+                }
+            }
+            Err(e) => return Err(e),
+        }
 
         // 3) Resources (serial)
         let mut resource_ops = Vec::new();
@@ -992,6 +1248,7 @@ impl PersistenceSession {
                                 expected_current_version: current_version,
                                 patch: value,
                             });
+                            committed_dirty_resources.insert(resource_type_id);
                         } else {
                             // create new resource
                             if let Some(obj) = value.as_object_mut() {
@@ -1003,6 +1260,7 @@ impl PersistenceSession {
                                 kind: DocumentKind::Resource,
                                 data: value,
                             });
+                            committed_dirty_resources.insert(resource_type_id);
                         }
                     }
                     Ok(None) => {}
@@ -1021,17 +1279,46 @@ impl PersistenceSession {
         if has_relationships && has_dirty_rels {
             use crate::core::db::connection::EdgeDocument;
 
-            // Build the current desired edge set from all relationship serializers
+            let mut scan_sources: HashSet<Entity> =
+                dirty_relationship_entities.iter().copied().collect();
+            scan_sources.extend(despawned_entities.iter().copied());
+
+            let dirty_guids: HashSet<String> = scan_sources
+                .iter()
+                .filter_map(|entity| {
+                    session
+                        .entity_key(*entity)
+                        .cloned()
+                        .or_else(|| preassigned_keys.get(entity).cloned())
+                })
+                .collect();
+
+            let retained_keys: HashSet<String> = session
+                .cache
+                .edge_snapshot
+                .iter()
+                .filter(|key| {
+                    edge_source_guid(key)
+                        .map(|guid| !dirty_guids.contains(guid))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+
             let mut current_edges: HashMap<String, EdgeDocument> = HashMap::new();
-            for (_type_id, serializer) in session.relationships.serializers.iter() {
-                let edges = serializer(world, session, &preassigned_keys)?;
-                for edge in edges {
-                    current_edges.insert(edge.key.clone(), edge);
+            if !scan_sources.is_empty() {
+                for (_type_id, serializer) in session.relationships.serializers.iter() {
+                    let edges = serializer(world, session, &preassigned_keys, &scan_sources)?;
+                    for edge in edges {
+                        current_edges.insert(edge.key.clone(), edge);
+                    }
                 }
             }
 
-            // Compute diff against snapshot
-            let current_keys: HashSet<String> = current_edges.keys().cloned().collect();
+            let current_keys: HashSet<String> = retained_keys
+                .into_iter()
+                .chain(current_edges.keys().cloned())
+                .collect();
 
             // Edges to upsert: in current but not in snapshot (new edges)
             let to_upsert: Vec<EdgeDocument> = current_keys
@@ -1074,6 +1361,10 @@ impl PersistenceSession {
             new_entities: newly_created_entities,
             new_edge_snapshot,
             preassigned_keys,
+            committed_entity_components,
+            committed_despawned_entities,
+            committed_dirty_resources,
+            committed_despawned_resources,
         })
     }
 }
@@ -1120,8 +1411,9 @@ mod arango_session {
         let mut session = PersistenceSession::new();
         session.register_component::<MyComp>();
 
-        let deserializer = session.component_deserializer(MyComp::name()).unwrap();
-        deserializer(&mut world, entity, json!({"value": 42})).unwrap();
+        session
+            .hydrate_entity_component(&mut world, entity, MyComp::name(), json!({"value": 42}))
+            .unwrap();
 
         assert_eq!(world.get::<MyComp>(entity).unwrap().value, 42);
     }
@@ -1134,8 +1426,9 @@ mod arango_session {
         let mut session = PersistenceSession::new();
         session.register_resource::<MyRes>();
 
-        let deserializer = session.resource_deserializer(MyRes::name()).unwrap();
-        deserializer(&mut world, json!({"value": 5})).unwrap();
+        session
+            .deserialize_resource_by_name(&mut world, MyRes::name(), json!({"value": 5}))
+            .unwrap();
 
         assert_eq!(world.resource::<MyRes>().value, 5);
     }
@@ -1250,7 +1543,7 @@ mod arango_session {
         let entity = world
             .spawn((
                 MyComp { value: 7 },
-                crate::bevy::components::Guid::new("my-custom-guid".to_string()),
+                Guid::new("my-custom-guid".to_string()),
             ))
             .id();
         let tid = TypeId::of::<MyComp>();
@@ -1297,7 +1590,7 @@ mod arango_session {
         session.register_relationship(
             tid,
             "TestRel",
-            Box::new(|_world, _session, _preassigned| {
+            Box::new(|_world, _session, _preassigned, _scan_sources| {
                 use crate::core::db::connection::EdgeDocument;
                 Ok(vec![
                     EdgeDocument {
@@ -1320,6 +1613,7 @@ mod arango_session {
 
         // Start with empty snapshot, mark some entity as having dirty relationships
         let dummy_entity = world.spawn_empty().id();
+        session.insert_entity_key(dummy_entity, "guid_a".to_string());
         let mut dirty_relationship_entities = HashSet::new();
         dirty_relationship_entities.insert(dummy_entity);
 
@@ -1369,7 +1663,7 @@ mod arango_session {
         session.register_relationship(
             tid,
             "TestRel",
-            Box::new(|_world, _session, _preassigned| Ok(vec![])),
+            Box::new(|_world, _session, _preassigned, _scan_sources| Ok(vec![])),
         );
 
         // Pre-populate snapshot with edges that should be deleted
@@ -1377,6 +1671,7 @@ mod arango_session {
         session.set_edge_snapshot([old_key.clone()].into_iter().collect());
 
         let dummy_entity = world.spawn_empty().id();
+        session.insert_entity_key(dummy_entity, "guid_a".to_string());
         let mut dirty_relationship_entities = HashSet::new();
         dirty_relationship_entities.insert(dummy_entity);
 
@@ -1429,7 +1724,7 @@ mod arango_session {
         session.register_relationship(
             tid,
             "TestRel",
-            Box::new(|_world, _session, _preassigned| {
+            Box::new(|_world, _session, _preassigned, _scan_sources| {
                 use crate::core::db::connection::EdgeDocument;
                 Ok(vec![EdgeDocument {
                     key: EdgeDocument::make_key("TestRel", "a", "b"),
@@ -1501,9 +1796,9 @@ mod arango_session {
         let mut session = PersistenceSession::new();
         session.register_component::<MarkerComp>();
 
-        let deserializer = session.component_deserializer(MarkerComp::name()).unwrap();
-        // null is the canonical serialized form of a unit struct
-        deserializer(&mut world, entity, serde_json::Value::Null).unwrap();
+        session
+            .hydrate_entity_component(&mut world, entity, MarkerComp::name(), serde_json::Value::Null)
+            .unwrap();
 
         assert!(
             world.get::<MarkerComp>(entity).is_some(),

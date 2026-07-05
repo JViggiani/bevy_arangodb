@@ -76,7 +76,7 @@ where
         app.add_systems(
             ::bevy::app::PostUpdate,
             auto_dirty_tracking_entity_system::<T>
-                .in_set(PersistenceSystemSet::ChangeDetection),
+                .in_set(PersistenceSystemSet::TrackChanges),
         );
     }
 }
@@ -117,7 +117,7 @@ where
         app.add_systems(
             ::bevy::app::PostUpdate,
             auto_dirty_tracking_resource_system::<R>
-                .in_set(PersistenceSystemSet::ChangeDetection),
+                .in_set(PersistenceSystemSet::TrackChanges),
         );
     }
 }
@@ -162,7 +162,7 @@ where
         app.add_systems(
             ::bevy::app::PostUpdate,
             auto_dirty_tracking_bevy_relationship_system::<R>
-                .in_set(PersistenceSystemSet::ChangeDetection),
+                .in_set(PersistenceSystemSet::TrackChanges),
         );
     }
 }
@@ -199,7 +199,7 @@ where
         app.add_systems(
             ::bevy::app::PostUpdate,
             auto_dirty_tracking_relationship_system::<R>
-                .in_set(PersistenceSystemSet::ChangeDetection),
+                .in_set(PersistenceSystemSet::TrackChanges),
         );
     }
 }

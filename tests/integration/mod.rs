@@ -8,6 +8,7 @@ pub mod arango_collection_name_tests;
 
 pub mod batching_tests;
 pub mod concurrency_tests;
+pub mod load_regression_tests;
 pub mod pass_through_tests;
 pub mod performance_tests;
 pub mod persisting_tests;

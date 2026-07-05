@@ -1,6 +1,5 @@
 //! A manual builder for creating and executing database queries that load results into a Bevy `World`.
 
-use crate::bevy::components::Guid;
 use crate::bevy::plugins::persistence_plugin::{PersistencePluginConfig, TokioRuntime};
 use crate::core::db::connection::{DatabaseConnectionResource, DocumentKind};
 use crate::core::db::{DatabaseConnection, read_version};
@@ -227,11 +226,12 @@ impl PersistenceQuery {
             .remove_resource::<PersistenceSession>()
             .expect("PersistenceSession missing");
 
-        let mut query_with_full_docs = self.clone();
-        query_with_full_docs.force_full_docs = true;
-        let spec = query_with_full_docs.build_spec();
+        let spec = self.build_spec();
 
-        bevy::log::debug!("[builder] fetch_into issuing execute_documents");
+        bevy::log::debug!(
+            "[builder] fetch_into issuing execute_documents (partial_projection={})",
+            !spec.return_full_docs
+        );
         let documents = db
             .execute_documents(&spec)
             .await
@@ -243,32 +243,12 @@ impl PersistenceQuery {
 
         let mut result = Vec::with_capacity(documents.len());
         if !documents.is_empty() {
-            let mut existing: bevy::platform::collections::HashMap<
-                String,
-                bevy::prelude::Entity,
-            > = bevy::platform::collections::HashMap::default();
-
-            for (e, guid) in world.query::<(bevy::prelude::Entity, &Guid)>().iter(world) {
-                existing.insert(guid.id().to_string(), e);
-            }
-
-            // Determine which components to deserialize. Computed once for the batch.
             // When no components are explicitly requested the query is unconstrained;
-            // apply every registered component type found in each document.
-            let to_deser: Vec<String> = {
-                let mut explicit: Vec<&'static str> = self.component_names.clone();
-                explicit.extend(self.fetch_only_component_names.iter().copied());
-                explicit.sort_unstable();
-                explicit.dedup();
-                if explicit.is_empty() {
-                    session
-                        .component_deserializers()
-                        .map(|(name, _)| name.clone())
-                        .collect()
-                } else {
-                    explicit.iter().map(|s| s.to_string()).collect()
-                }
-            };
+            // hydrate every registered component field found in each document.
+            let mut explicit_components: Vec<&'static str> = self.component_names.clone();
+            explicit_components.extend(self.fetch_only_component_names.iter().copied());
+            explicit_components.sort_unstable();
+            explicit_components.dedup();
 
             for doc in documents {
                 let key_field = db.document_key_field();
@@ -281,34 +261,21 @@ impl PersistenceQuery {
                     continue;
                 }
 
-                let version = read_version(&doc).unwrap_or(1);
-
-                let entity = if let Some(&e) = existing.get(&key) {
-                    e
-                } else {
-                    let e = world.spawn(Guid::new(key.clone())).id();
-                    existing.insert(key.clone(), e);
-                    e
-                };
-
-                session.insert_entity_key(entity, key.clone());
-                session
-                    .version_manager_mut()
-                    .set_version(VersionKey::Entity(key.clone()), version);
-
                 bevy::log::trace!(
                     "[builder] deserializing {:?} for key={}",
-                    to_deser,
+                    explicit_components,
                     key
                 );
-                for comp in &to_deser {
-                    if let Some(val) = doc.get(comp.as_str()) {
-                        if let Some(deser) = session.component_deserializer(comp) {
-                            deser(world, entity, val.clone())
-                                .expect("component deserialization failed");
-                        }
-                    }
-                }
+                let entity = session
+                    .materialize_entity_document(
+                        world,
+                        &doc,
+                        key_field,
+                        &explicit_components,
+                        true,
+                    )
+                    .expect("component deserialization failed")
+                    .expect("document key should be present");
 
                 result.push(entity);
             }
@@ -325,6 +292,100 @@ impl PersistenceQuery {
             result.len()
         );
         result
+    }
+
+    /// Re-read persisted versions from the database into the in-memory version cache,
+    /// without spawning entities or deserializing components.
+    ///
+    /// **Not for routine gameplay.** In a single-writer setup, an optimistic-concurrency
+    /// conflict during normal commits indicates a pipeline bug (version cache drift, load
+    /// dirt, etc.) and should be investigated — not silently papered over.
+    ///
+    /// Use this explicitly when the database was changed outside the running app (ops,
+    /// migration, manual repair, restore) and the in-memory version map must be realigned
+    /// to match. Live ECS state is left untouched; only the OCC version map is refreshed.
+    /// Returns the number of entity/resource versions updated.
+    ///
+    /// Intended for use inside exclusive systems (`fn my_system(world: &mut World)`).
+    pub fn reconcile_versions(mut self, world: &mut World) -> usize {
+        if self.db.is_none() {
+            self.db = Some(
+                world
+                    .resource::<DatabaseConnectionResource>()
+                    .connection
+                    .clone(),
+            );
+        }
+        if self.store.is_none() {
+            self.store = Some(
+                world
+                    .resource::<PersistencePluginConfig>()
+                    .default_store
+                    .clone(),
+            );
+        }
+        let runtime = world.resource::<TokioRuntime>().runtime.clone();
+        runtime.block_on(self.reconcile_versions_into(world))
+    }
+
+    async fn reconcile_versions_into(&self, world: &mut World) -> usize {
+        let db = self
+            .db
+            .as_ref()
+            .expect("PersistenceQuery: call with_db() or use run() before reconcile_versions()");
+
+        let mut query_with_full_docs = self.clone();
+        query_with_full_docs.force_full_docs = true;
+        let spec = query_with_full_docs.build_spec();
+
+        let documents = match db.execute_documents(&spec).await {
+            Ok(docs) => docs,
+            Err(e) => {
+                bevy::log::error!("version reconcile: document fetch failed: {e}");
+                return 0;
+            }
+        };
+
+        let mut session = world
+            .remove_resource::<PersistenceSession>()
+            .expect("PersistenceSession missing");
+
+        let key_field = db.document_key_field();
+        let store = self
+            .store
+            .as_deref()
+            .expect("PersistenceQuery: call store() or use run() before reconcile_versions()");
+        let mut realigned = 0usize;
+        for doc in &documents {
+            let key = doc[key_field].as_str().unwrap_or_default().to_string();
+            if key.is_empty() {
+                continue;
+            }
+            let version = read_version(doc).unwrap_or(1);
+            session
+                .version_manager_mut()
+                .set_version(VersionKey::Entity(key), version);
+            realigned += 1;
+        }
+
+        let resource_types: Vec<_> = session.persisted_resource_types().collect();
+        for type_id in resource_types {
+            let Some(res_name) = session.resource_name_for_type(type_id) else {
+                continue;
+            };
+            if let Ok(Some((_, version))) = db.fetch_resource(store, res_name).await {
+                session
+                    .version_manager_mut()
+                    .set_version(VersionKey::Resource(type_id), version);
+                realigned += 1;
+            }
+        }
+
+        world.insert_resource(session);
+        bevy::log::info!(
+            "version reconcile: realigned {realigned} entity/resource versions from the database"
+        );
+        realigned
     }
 }
 
@@ -376,10 +437,12 @@ impl WithComponentExt for PersistenceQuery {
 mod tests {
     use super::*;
     use crate::bevy::plugins::persistence_plugin::PersistencePluginCore;
-    use crate::core::db::connection::{
-        BEVY_PERSISTENCE_DATABASE_BEVY_TYPE_FIELD, BEVY_PERSISTENCE_DATABASE_METADATA_FIELD,
-        BEVY_PERSISTENCE_DATABASE_VERSION_FIELD, DocumentKind, MockDatabaseConnection,
-        PersistenceError,
+    use crate::core::db::{
+        MockDatabaseConnection,
+        connection::{
+            BEVY_PERSISTENCE_DATABASE_BEVY_TYPE_FIELD, BEVY_PERSISTENCE_DATABASE_METADATA_FIELD,
+            BEVY_PERSISTENCE_DATABASE_VERSION_FIELD, DocumentKind, PersistenceError,
+        },
     };
     use crate::core::session::PersistenceSession;
     use bevy::MinimalPlugins;
@@ -447,7 +510,12 @@ mod tests {
         let mut mock_db = MockDatabaseConnection::new();
         mock_db.expect_document_key_field().return_const("_key");
         mock_db.expect_execute_documents().returning(|spec| {
-            assert!(spec.return_full_docs, "execute_documents must be full-docs");
+            assert!(
+                !spec.return_full_docs,
+                "narrow query should use partial projection"
+            );
+            assert!(spec.fetch_only.contains(&"Health"));
+            assert!(spec.fetch_only.contains(&"Position"));
             Box::pin(async {
                 Ok(vec![
                     json!({
@@ -456,7 +524,7 @@ mod tests {
                             BEVY_PERSISTENCE_DATABASE_VERSION_FIELD: 1,
                             BEVY_PERSISTENCE_DATABASE_BEVY_TYPE_FIELD: DocumentKind::Entity.as_str(),
                         },
-                        "Health": {"value": 1},
+                        "Health": 1,
                         "Position": {"x": 1.0, "y": 2.0},
                     }),
                     json!({
@@ -465,7 +533,7 @@ mod tests {
                             BEVY_PERSISTENCE_DATABASE_VERSION_FIELD: 1,
                             BEVY_PERSISTENCE_DATABASE_BEVY_TYPE_FIELD: DocumentKind::Entity.as_str(),
                         },
-                        "Health": {"value": 3},
+                        "Health": 3,
                         "Position": {"x": 4.0, "y": 5.0},
                     }),
                 ])
@@ -497,6 +565,30 @@ mod tests {
         let loaded = query.fetch_into(app.world_mut()).await;
 
         assert_eq!(loaded.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_into_unconstrained_uses_full_docs() {
+        let mut mock_db = MockDatabaseConnection::new();
+        mock_db.expect_document_key_field().return_const("_key");
+        mock_db.expect_execute_documents().returning(|spec| {
+            assert!(
+                spec.return_full_docs,
+                "unconstrained query should fetch full documents"
+            );
+            Box::pin(async { Ok(vec![]) })
+        });
+        mock_db
+            .expect_fetch_resource()
+            .returning(|_, _| Box::pin(async { Ok(None) }));
+
+        let db = Arc::new(mock_db) as Arc<dyn DatabaseConnection>;
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(PersistencePluginCore::new(db.clone()));
+
+        let query = PersistenceQuery::new().with_db(db).store(TEST_STORE);
+        let _ = query.fetch_into(app.world_mut()).await;
     }
 
     #[test]

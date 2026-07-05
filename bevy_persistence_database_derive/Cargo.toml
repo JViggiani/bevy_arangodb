@@ -16,6 +16,7 @@ proc-macro = true
 [features]
 default = []
 ra-fallback = []
+bevy_many_relationship_edges = []
 
 [dependencies]
 syn = { workspace = true, features = ["derive", "parsing"] }

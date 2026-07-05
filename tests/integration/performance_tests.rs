@@ -25,10 +25,9 @@ fn test_persist_many_entities() {
 
     // Create app with explicit configuration
     let config = PersistencePluginConfig {
-        batching_enabled: true,
-        commit_batch_size: 1000,
         thread_count,
         default_store: TEST_STORE.to_string(),
+        ..Default::default()
     };
     let mut app = setup_test_app(db.clone(), Some(config.clone()));
 

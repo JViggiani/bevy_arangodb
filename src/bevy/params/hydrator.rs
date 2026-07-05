@@ -249,30 +249,9 @@ impl<'w, 's> PersistenceRelationshipHydrator<'w, 's> {
         doc: serde_json::Value,
     ) -> Option<Entity> {
         let key_field = self.db.connection.document_key_field();
-        let entity = world
-            .query::<(Entity, &crate::bevy::components::Guid)>()
-            .iter(world)
-            .find_map(|(entity, guid)| if guid.id() == key { Some(entity) } else { None })
-            .or_else(|| session.entity_by_key(key))
-            .unwrap_or_else(|| world.spawn(crate::bevy::components::Guid::new(key.to_string())).id());
-
-        session.insert_entity_key(entity, key.to_string());
-
-        let mut materialized = doc;
-        if materialized.get(key_field).is_none() {
-            if let Some(map) = materialized.as_object_mut() {
-                map.insert(key_field.to_string(), serde_json::Value::String(key.to_string()));
-            }
-        }
-
-        for (name, deser) in session.component_deserializers() {
-            if let Some(value) = materialized.get(name) {
-                if deser(world, entity, value.clone()).is_err() {
-                    return None;
-                }
-            }
-        }
-
-        Some(entity)
+        session
+            .materialize_entity_document_for_key(world, key, doc, key_field, &[])
+            .ok()
+            .flatten()
     }
 }

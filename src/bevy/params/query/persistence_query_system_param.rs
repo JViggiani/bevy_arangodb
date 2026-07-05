@@ -1,14 +1,14 @@
 //! Implements a Bevy SystemParam for querying entities from both world and database
 //! in a seamless, integrated way.
 
-use bevy::ecs::query::{QueryData, QueryFilter, QueryState};
+use bevy::ecs::query::{IterQueryData, QueryData, QueryFilter, QueryState};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::{Entity, Query, Res, World};
 
 use crate::bevy::plugins::persistence_plugin::{PersistencePluginConfig, PersistenceThreadPool, TokioRuntime};
 use crate::bevy::world_access::{DeferredWorldOperations, ImmediateWorldPtr};
-use crate::core::db::connection::DatabaseConnectionResource;
-use crate::core::query::FilterExpression;
+use crate::core::db::connection::{DatabaseConnectionResource, DocumentKind};
+use crate::core::query::{EdgeQuerySpecification, FilterExpression, PersistenceQuerySpecification};
 use crate::core::session::PersistenceSession;
 use std::any::TypeId;
 
@@ -52,7 +52,7 @@ pub type PersistentQuery<'w, 's, Q, F = ()> = PersistentQueryParam<'w, 's, Q, F>
 
 impl<'w, 's, Q, F> PersistentQuery<'w, 's, Q, F>
 where
-    Q: QueryData + QueryDataToComponents,
+    Q: QueryData + IterQueryData + QueryDataToComponents,
     F: QueryFilter + ToPresenceSpec,
 {
     #[inline]
@@ -191,9 +191,9 @@ where
             return self;
         }
 
-        let spec = crate::core::query::PersistenceQuerySpecification {
+        let spec = PersistenceQuerySpecification {
             store: store.clone(),
-            kind: crate::core::db::connection::DocumentKind::Entity,
+            kind: DocumentKind::Entity,
             presence_with: presence_names.clone(),
             presence_without: without_names.clone(),
             fetch_only: fetch_names.clone(),
@@ -207,7 +207,7 @@ where
 
         self.ops.push(Box::new(move |world: &mut World| {
             let rt = world
-                .resource::<crate::bevy::plugins::persistence_plugin::TokioRuntime>()
+                .resource::<TokioRuntime>()
                 .runtime
                 .clone();
 
@@ -253,7 +253,7 @@ where
                         let Some(rel_name) = session.relationship_type_name(&type_id) else {
                             continue;
                         };
-                        let edge_spec = crate::core::query::EdgeQuerySpecification {
+                        let edge_spec = EdgeQuerySpecification {
                             store: store_for_op.clone(),
                             relationship_types: vec![rel_name.to_string()],
                             from_guids: loaded_keys.clone(),

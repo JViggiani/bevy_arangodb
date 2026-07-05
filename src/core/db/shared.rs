@@ -2,6 +2,65 @@
 
 use crate::core::db::connection::{DocumentKind, EdgeDocument, PersistenceError, TransactionOperation};
 use serde_json::Value;
+use std::collections::HashSet;
+use std::sync::RwLock;
+
+/// Tracks store/collection names that have already passed DDL ensure checks.
+#[derive(Default)]
+pub struct EnsuredStores {
+    names: RwLock<HashSet<String>>,
+}
+
+impl EnsuredStores {
+    pub fn is_ensured(&self, name: &str) -> bool {
+        self.names
+            .read()
+            .ok()
+            .map(|guard| guard.contains(name))
+            .unwrap_or(false)
+    }
+
+    pub fn mark_ensured(&self, name: impl Into<String>) {
+        if let Ok(mut guard) = self.names.write() {
+            guard.insert(name.into());
+        }
+    }
+}
+
+/// Escape a SQL string literal embedded in a query fragment.
+pub fn escape_sql_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+/// Build a single-query Arango BFS AQL that unrolls `depth` levels via LET bindings.
+pub fn build_arango_edge_bfs_aql(depth: usize) -> String {
+    if depth == 0 {
+        return String::new();
+    }
+    let mut parts = Vec::with_capacity(depth * 2);
+    let mut frontier = "@from_guids".to_string();
+    for i in 0..depth {
+        parts.push(format!(
+            "LET l{i} = (FOR e IN @@col\n  FILTER LENGTH(@types) == 0 OR e.relationship_type IN @types\n  FILTER e.from_guid IN {frontier}\n  FILTER LENGTH(@to_guids) == 0 OR e.to_guid IN @to_guids\n  RETURN {{ key: e._key, relationship_type: e.relationship_type, from_guid: e.from_guid, to_guid: e.to_guid, payload: e.payload }})"
+        ));
+        if i + 1 < depth {
+            frontier = format!("UNIQUE(l{i}[*].to_guid)");
+        }
+    }
+    let levels = (0..depth)
+        .map(|i| format!("l{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    parts.push(format!("FOR edge IN FLATTEN([{levels}]) RETURN edge"));
+    parts.join("\n")
+}
+
+/// Extract the source GUID from a deterministic edge key `{type}:{from}:{to}`.
+pub fn edge_source_guid(key: &str) -> Option<&str> {
+    let mut parts = key.splitn(3, ':');
+    let _rel = parts.next()?;
+    parts.next()
+}
 
 /// Document CRUD operations for a single document kind (entity or resource).
 pub struct DocumentOperations {

@@ -1,10 +1,9 @@
-use crate::bevy::components::Guid;
-use crate::core::db::read_version;
+use crate::bevy::plugins::persistence_plugin::TokioRuntime;
+use crate::core::db::connection::DocumentKind;
 use crate::core::query::{
     EdgeQuerySpecification, FilterExpression, PaginationConfig, PersistenceQuerySpecification,
 };
 use crate::core::session::PersistenceSession;
-use crate::core::versioning::version_manager::VersionKey;
 use super::cache::CachePolicy;
 use super::persistence_query_system_param::PersistentQuery;
 use super::query_thread_local::{RelationshipLoadSpec, take_pagination_config};
@@ -24,91 +23,30 @@ impl<'w, 's, Q: QueryData + 'static, F: QueryFilter + 'static> PersistentQuery<'
         allow_overwrite: bool,
         key_field: &str,
     ) {
-        let Some(key) = doc
-            .get(key_field)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-        else {
-            bevy::log::trace!(
-                "apply_one_document: skipping doc missing key '{}'",
-                key_field
-            );
-            return;
-        };
-        let version = read_version(doc).unwrap_or(1);
-
-        // Try to find an existing entity by Guid first.
-        let existing_entity = world
-            .query::<(Entity, &Guid)>()
-            .iter(world)
-            .find(|(_, g)| g.id() == key)
-            .map(|(e, _)| e);
-
-        // Resolve or spawn the entity for this key
-        let (entity, existed) = if let Some(existing) = existing_entity {
-            if !session.entity_keys().contains_key(&existing) {
-                session.insert_entity_key(existing, key.clone());
+        match session.materialize_entity_document(
+            world,
+            doc,
+            key_field,
+            comps,
+            allow_overwrite,
+        ) {
+            Ok(None) => {
+                bevy::log::trace!(
+                    "apply_one_document: skipping doc missing key '{}'",
+                    key_field
+                );
             }
-            (existing, true)
-        } else if let Some((candidate, _)) = session
-            .entity_keys()
-            .iter()
-            .find(|(_, k)| **k == key)
-            .map(|(e, k)| (*e, k.clone()))
-        {
-            if world.get_entity(candidate).is_ok() {
-                (candidate, true)
-            } else {
-                let e = world.spawn(Guid::new(key.clone())).id();
-                session.insert_entity_key(e, key.clone());
-                (e, false)
-            }
-        } else {
-            let e = world.spawn(Guid::new(key.clone())).id();
-            session.insert_entity_key(e, key.clone());
-            (e, false)
-        };
-
-        if existed && !allow_overwrite {
-            bevy::log::trace!(
-                "apply_one_document: skip overwrite entity={:?} key={}",
-                entity,
-                key
-            );
-            return;
-        }
-
-        // Cache/refresh version
-        session
-            .version_manager_mut()
-            .set_version(VersionKey::Entity(key.clone()), version);
-
-        // Insert components - optimized for common case
-        if !comps.is_empty() {
-            for &comp_name in comps {
-                if let Some(val) = doc.get(comp_name) {
-                    if let Some(deser) = session.component_deserializer(comp_name) {
-                        if let Err(e) = deser(world, entity, val.clone()) {
-                            bevy::log::error!(
-                                "Failed to deserialize component {}: {}",
-                                comp_name,
-                                e
-                            );
-                        }
-                    }
-                }
-            }
-        } else {
-            for (registered_name, deser) in session.component_deserializers() {
-                if let Some(val) = doc.get(registered_name) {
-                    if let Err(e) = deser(world, entity, val.clone()) {
-                        bevy::log::error!(
-                            "Failed to deserialize component {}: {}",
-                            registered_name,
-                            e
-                        );
-                    }
-                }
+            Ok(Some(_)) => {}
+            Err(e) => {
+                let key = doc
+                    .get(key_field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<missing>");
+                bevy::log::error!(
+                    "Failed to materialize entity document for key {}: {}",
+                    key,
+                    e
+                );
             }
         }
     }
@@ -261,7 +199,7 @@ impl<'w, 's, Q: QueryData + 'static, F: QueryFilter + 'static> PersistentQuery<'
         if should_query_db {
             let spec = PersistenceQuerySpecification {
                 store: store.clone(),
-                kind: crate::core::db::connection::DocumentKind::Entity,
+                kind: DocumentKind::Entity,
                 presence_with: presence_with.clone(),
                 presence_without: presence_without.clone(),
                 fetch_only: fetch_only.clone(),
@@ -327,7 +265,7 @@ impl<'w, 's, Q: QueryData + 'static, F: QueryFilter + 'static> PersistentQuery<'
 
                                 // Fetch resources once alongside the entity loads.
                                 let rt = world
-                                    .resource::<crate::bevy::plugins::persistence_plugin::TokioRuntime>()
+                                    .resource::<TokioRuntime>()
                                     .runtime
                                     .clone();
                                 let db = self.db.connection.clone();
@@ -385,7 +323,7 @@ impl<'w, 's, Q: QueryData + 'static, F: QueryFilter + 'static> PersistentQuery<'
                             self.ops.push(Box::new(move |world: &mut World| {
                                 world.resource_scope(|world, mut session: Mut<PersistenceSession>| {
                                     let rt = world
-                                        .resource::<crate::bevy::plugins::persistence_plugin::TokioRuntime>()
+                                        .resource::<TokioRuntime>()
                                         .runtime
                                         .clone();
                                     bevy::log::trace!("PQ::execute_combined_load: fetching resources");

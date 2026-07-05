@@ -139,22 +139,26 @@ Listeners are just oneshot senders keyed by a correlation ID. Each `TriggerCommi
 use bevy_persistence_database::{PersistencePlugins, persistence_plugin::PersistencePluginConfig};
 
 let config = PersistencePluginConfig {
-    batching_enabled: true,
-    commit_batch_size: 500,
     thread_count: 4,
     default_store: "example".into(),
+    ..Default::default()
 };
 
 app.add_plugins(PersistencePlugins::new(db.clone()).with_config(config));
 ```
 
-- `batching_enabled`/`commit_batch_size`: control commit chunking and parallel execution.
-- `thread_count`: Rayon pool size used for commit preparation.
+- `thread_count`: Rayon pool size used for parallel commit preparation (serialization).
 - `default_store`: fallback store when queries/commits don’t override `.store()`.
+
+Load-induced dirty flags are suppressed automatically during hydration ([`PersistenceSession::materialize_entity_document`], [`PersistenceSession::materialize_resource`], and related load APIs open a scope; PostUpdate [`PersistenceSystemSet::FinishHydration`] closes it after dirty tracking). Use [`PersistenceQuery::reconcile_versions`](crate::bevy::query::PersistenceQuery::reconcile_versions) manually after ops/migration if the in-memory version cache must be realigned to the database.
+
+### Commit scheduling helper
+
+`persistence_plugin::commit_in_flight` is a run-condition that is `true` while a commit is in progress or queued. Gate a periodic commit-trigger system with `.run_if(not(commit_in_flight))` to avoid preparing a redundant trigger (and its bookkeeping) while one is still running.
 
 ## Scheduling notes
 - Loads can run in `Update` or `PostUpdate`.
-- Deferred world mutations from loads are applied before `PersistenceSystemSet::PreCommit`.
+- Deferred world mutations from loads are applied in `PersistenceSystemSet::LoadApply`, before `TrackChanges`.
 - Commit pipeline runs in `PersistenceSystemSet::Commit`; readers that need fresh data should run after `PreCommit`.
 
 ## Error handling

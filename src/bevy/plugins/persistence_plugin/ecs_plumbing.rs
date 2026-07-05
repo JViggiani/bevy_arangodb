@@ -1,6 +1,7 @@
-use bevy::prelude::{App, World};
+use bevy::prelude::{App, ResMut, World};
 
 use crate::bevy::world_access::{DeferredWorldOperations, ImmediateWorldPtr};
+use crate::core::session::PersistenceSession;
 
 pub(crate) fn insert_initial_immediate_world_ptr(app: &mut App) {
     let ptr: *mut World = app.world_mut() as *mut World;
@@ -33,12 +34,26 @@ pub(crate) fn apply_deferred_world_ops(world: &mut World) {
     }
 }
 
+/// Close hydration scopes opened during load, after dirty tracking has run.
+///
+/// Hydration scopes are opened automatically by [`PersistenceSession::materialize_entity_document`],
+/// [`PersistenceSession::materialize_resource`], and related load APIs. This runs in
+/// `PersistenceSystemSet::FinishHydration` so change detection in `TrackChanges` still sees
+/// an active hydration scope.
+pub(crate) fn finish_hydration(mut session: ResMut<PersistenceSession>) {
+    if !session.is_hydrating() {
+        return;
+    }
+    session.finish_all_hydration();
+    bevy::log::debug!("finished hydration scopes; dirty tracking baseline is now gameplay state");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bevy::params::resource::PersistentRes;
     use crate::bevy::plugins::persistence_plugin::PersistencePlugins;
-    use crate::core::db::connection::MockDatabaseConnection;
+    use crate::core::db::MockDatabaseConnection;
     use crate::core::session::PersistenceSession;
     use bevy::prelude::*;
     use bevy_persistence_database_derive::persist;
