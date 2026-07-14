@@ -1,6 +1,6 @@
 [package]
 name = "bevy_persistence_database"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "A persistence and database integration solution for the Bevy game engine"
 license-file = "LICENSE"
@@ -20,7 +20,7 @@ members = [
 edition = "2024"
 
 [workspace.dependencies]
-bevy = { version = "0.19", default-features = false, features = ["bevy_log"] }
+bevy = { version = "0.18", default-features = false, features = ["bevy_log"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 arangors = "0.6.0"
@@ -37,7 +37,7 @@ testcontainers = "0.19.0"
 debug = true
 
 [dependencies]
-bevy_persistence_database_derive = { version = "0.5.0", path = "bevy_persistence_database_derive" }
+bevy_persistence_database_derive = { version = "0.6.0", path = "bevy_persistence_database_derive" }
 bevy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -52,7 +52,7 @@ rayon = "1.10.0"
 uuid = { version = "1.18.0", features = ["v4"] }
 tokio-postgres = { version = "0.7.13", features = ["with-serde_json-1"], optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
-bevy_many_relationships = { version = "0.2.0", optional = true }
+bevy_many_relationships = { version = "0.3.0", optional = true }
 
 [features]
 default = ["postgres", "arango"]
@@ -73,7 +73,7 @@ futures = { workspace = true }
 tracing-subscriber = "0.3.19"
 tracing = "0.1.40"
 mockall = { workspace = true }
-bevy_persistence_database_derive = { version = "0.5.0", path = "bevy_persistence_database_derive" }
+bevy_persistence_database_derive = { version = "0.6.0", path = "bevy_persistence_database_derive" }
 
 [[test]]
 name = "integration_tests"

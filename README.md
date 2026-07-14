@@ -9,12 +9,21 @@ Persistence for Bevy ECS to ArangoDB or Postgres with an idiomatic Bevy Query AP
 - Resources persisted alongside components with `#[persist(resource)]`.
 - Batching + parallel commit execution; per-document versioning for optimistic concurrency.
 
+## Bevy Version Support
+
+| Bevy | bevy_persistence_database |
+| --- | --- |
+| 0.16 | 0.1.x |
+| 0.17 | 0.2.x - 0.5.x |
+| 0.18 | 0.6.x |
+| 0.19 | 0.5.x (yanked) |
+
 ## Install
 
 ```toml
 [dependencies]
-bevy = { version = "0.17", default-features = false, features = ["bevy_log"] }
-bevy_persistence_database = { version = "0.2.2", features = ["arango", "postgres"] }
+bevy = { version = "0.18", default-features = false, features = ["bevy_log"] }
+bevy_persistence_database = { version = "0.6.0", features = ["arango", "postgres"] }
 ```
 
 Enable `arango` or `postgres` features based on your backend and supply an `Arc<dyn DatabaseConnection>` at startup.
@@ -164,3 +173,15 @@ Load-induced dirty flags are suppressed automatically during hydration ([`Persis
 ## Error handling
 
 All public APIs return `Result<_, PersistenceError>`. Version conflicts, connection issues, and timeouts surface through that error type so you can decide whether to retry, fail the job, or surface an error to callers.
+
+## `bevy_many_relationship_edges` local development
+
+The optional `bevy_many_relationship_edges` feature depends on the published `bevy_many_relationships` crate. To exercise both relationship backends against an unpublished checkout, patch crates.io locally (do not commit monorepo-specific paths into this repository):
+
+```toml
+# .cargo/config.toml (local only)
+[patch.crates-io]
+bevy_many_relationships = { path = "../bevy_many_relationships" }
+```
+
+Then run `cargo test --features bevy_many_relationship_edges`. In the dicemind monorepo, the parent repository supplies this patch automatically; see `libraries/README.md`.

@@ -1,7 +1,7 @@
 //! Implements a Bevy SystemParam for querying entities from both world and database
 //! in a seamless, integrated way.
 
-use bevy::ecs::query::{IterQueryData, QueryData, QueryFilter, QueryState};
+use bevy::ecs::query::{QueryData, QueryFilter, QueryState};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::{Entity, Query, Res, World};
 
@@ -52,7 +52,7 @@ pub type PersistentQuery<'w, 's, Q, F = ()> = PersistentQueryParam<'w, 's, Q, F>
 
 impl<'w, 's, Q, F> PersistentQuery<'w, 's, Q, F>
 where
-    Q: QueryData + IterQueryData + QueryDataToComponents,
+    Q: QueryData + QueryDataToComponents,
     F: QueryFilter + ToPresenceSpec,
 {
     #[inline]

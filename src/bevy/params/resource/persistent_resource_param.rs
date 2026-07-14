@@ -1,6 +1,5 @@
 use std::marker::PhantomData;
 
-use bevy::ecs::component::Mutable;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::{Mut, Resource, World};
 
@@ -103,7 +102,7 @@ impl<'w, T: Resource + Persist> PersistentRes<'w, T> {
     }
 }
 
-impl<'w, T: Resource<Mutability = Mutable> + Persist> PersistentResMut<'w, T> {
+impl<'w, T: Resource + Persist> PersistentResMut<'w, T> {
     /// Override the store for the next load of this resource.
     pub fn store(self, store: impl Into<String>) -> Self {
         set_resource_store(store);
