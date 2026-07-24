@@ -188,6 +188,11 @@ pub fn persist(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// more fields later does not flip the on-disk shape from scalar to object.
 /// Deserialization also accepts the legacy bare scalar produced by the old
 /// `#[serde(transparent)]` representation for backward compatibility.
+///
+/// Serde impls are emitted in the **enclosing module** (not a nested `mod`). Nested
+/// helpers broke short field-type paths like `use foo::Bar; struct Wrap(pub Bar);`
+/// because `#field_ty` was pasted into a child module where the parent's `use`
+/// imports are not in scope.
 fn single_field_serde_tokens(
     s: &syn::ItemStruct,
     enabled: bool,
@@ -215,29 +220,27 @@ fn single_field_serde_tokens(
 
     let struct_ident = &s.ident;
     let field_name_lit = syn::LitStr::new(&field_name, proc_macro2::Span::call_site());
-    let serde_mod = format_ident!("__persist_serde_{}", struct_ident);
 
     Some(quote! {
-        #[allow(non_snake_case)]
-        mod #serde_mod {
-            use super::#struct_ident;
-            use ::serde::de::Error as _;
-            use ::serde::{Deserialize, Deserializer, Serialize, Serializer};
-            use ::serde::ser::SerializeStruct;
-
-            pub fn serialize<S>(value: &#struct_ident, serializer: S) -> Result<S::Ok, S::Error>
+        impl ::serde::Serialize for #struct_ident {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
                 S: ::serde::Serializer,
             {
+                use ::serde::ser::SerializeStruct;
                 let mut state = serializer.serialize_struct(stringify!(#struct_ident), 1)?;
-                state.serialize_field(#field_name_lit, &value.#field_ident)?;
+                state.serialize_field(#field_name_lit, &self.#field_ident)?;
                 state.end()
             }
+        }
 
-            pub fn deserialize<'de, D>(deserializer: D) -> Result<#struct_ident, D::Error>
+        impl<'de> ::serde::Deserialize<'de> for #struct_ident {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where
                 D: ::serde::Deserializer<'de>,
             {
+                use ::serde::de::Error as _;
+                use ::serde::Deserialize;
                 let raw = ::serde_json::Value::deserialize(deserializer)?;
                 let inner = if let Some(obj) = raw.as_object() {
                     obj.get(#field_name_lit)
@@ -251,24 +254,6 @@ fn single_field_serde_tokens(
                 Ok(#struct_ident {
                     #field_ident: field_value,
                 })
-            }
-        }
-
-        impl ::serde::Serialize for #struct_ident {
-            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: ::serde::Serializer,
-            {
-                #serde_mod::serialize(self, serializer)
-            }
-        }
-
-        impl<'de> ::serde::Deserialize<'de> for #struct_ident {
-            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-            where
-                D: ::serde::Deserializer<'de>,
-            {
-                #serde_mod::deserialize(deserializer)
             }
         }
     })

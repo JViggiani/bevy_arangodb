@@ -1782,6 +1782,36 @@ mod arango_session {
         assert_eq!(deserialized, MarkerComponent);
     }
 
+    // GIVEN a single-field #[persist(resource)] whose field type is imported by short name
+    // WHEN it is serialized and deserialized (object shape and legacy bare scalar)
+    // THEN the value round-trips
+    //   AND the type compiles (nested serde helper mods used to break short imports)
+    #[test]
+    fn single_field_persist_accepts_short_imported_field_type() {
+        mod inner {
+            #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+            pub struct Payload {
+                pub n: i32,
+            }
+        }
+
+        use inner::Payload;
+
+        #[persist(resource)]
+        #[derive(Debug, Clone, PartialEq)]
+        struct Wrapped(pub Payload);
+
+        let value = Wrapped(Payload { n: 7 });
+        let json = serde_json::to_value(&value).unwrap();
+        assert_eq!(json, serde_json::json!({"0": {"n": 7}}));
+
+        let back: Wrapped = serde_json::from_value(json).unwrap();
+        assert_eq!(back, value);
+
+        let legacy: Wrapped = serde_json::from_value(serde_json::json!({"n": 7})).unwrap();
+        assert_eq!(legacy, value);
+    }
+
     /// Unit struct components should be deserializable from the persistence
     /// session's component deserializer, enabling them to be hydrated from the DB.
     #[test]
