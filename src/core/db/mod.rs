@@ -13,6 +13,7 @@ pub use connection::{
 #[cfg(feature = "arango")]
 pub use arango_connection::{
     ArangoAuthMode, ArangoAuthRefresh, ArangoConnectionConfig, ArangoDbConnection,
+    DEFAULT_MAX_TRANSACTION_SIZE_BYTES,
 };
 #[cfg(feature = "postgres")]
 pub use postgres_connection::PostgresDbConnection;

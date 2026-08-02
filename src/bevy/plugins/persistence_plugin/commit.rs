@@ -79,36 +79,48 @@ pub(super) struct CommitMeta {
     preassigned_keys: HashMap<Entity, String>,
 }
 
+/// Handles [`TriggerCommit`] messages.
+///
+/// Multiple triggers in one frame are coalesced: the first starts (or queues) a commit
+/// using its connection/store/correlation id; any further messages only ensure a follow-up
+/// commit is queued via [`CommitStatus::InProgressAndDirty`] (their correlation ids are not
+/// retained — register at most one waiter per coalesced burst).
 pub(super) fn handle_commit_trigger(ecs: &mut World) {
     let mut should_commit = false;
+    let mut queue_follow_up = false;
     let mut correlation_id = None;
-    let mut requested_connection: Option<Arc<dyn DatabaseConnection>> = None;
-    let mut requested_store: Option<String> = None;
+    let mut connection: Option<Arc<dyn DatabaseConnection>> = None;
+    let mut store: Option<String> = None;
 
     ecs.resource_scope(|ecs, mut events: Mut<Messages<TriggerCommit>>| {
-        let mut status = ecs.resource_mut::<CommitStatus>();
-        if !events.is_empty() {
-            let first_trigger = events.drain().next().unwrap();
-            requested_connection = Some(first_trigger.target_connection.clone());
-            requested_store = Some(first_trigger.store.clone());
+        let mut drained = events.drain();
+        let Some(first) = drained.next() else {
+            return;
+        };
+        // Remaining drained messages are dropped (coalesced into follow-up).
+        let extras = drained.count();
 
-            match *status {
-                CommitStatus::Idle => {
-                    bevy::log::debug!(
-                        "[handle_commit_trigger] TriggerCommit received while Idle"
-                    );
-                    should_commit = true;
-                    correlation_id = first_trigger.correlation_id;
-                }
-                CommitStatus::InProgress => {
-                    bevy::log::debug!(
-                        "[handle_commit_trigger] TriggerCommit received while busy; queueing"
-                    );
-                    *status = CommitStatus::InProgressAndDirty;
-                }
-                CommitStatus::InProgressAndDirty => {
-                    // A commit is already in progress and another is already queued.
-                }
+        connection = Some(first.target_connection);
+        store = Some(first.store);
+        correlation_id = first.correlation_id;
+
+        let mut status = ecs.resource_mut::<CommitStatus>();
+        match *status {
+            CommitStatus::Idle => {
+                bevy::log::debug!(
+                    "[handle_commit_trigger] TriggerCommit received while Idle (extras={extras})"
+                );
+                should_commit = true;
+                queue_follow_up = extras > 0;
+            }
+            CommitStatus::InProgress => {
+                bevy::log::debug!(
+                    "[handle_commit_trigger] TriggerCommit received while busy; queueing"
+                );
+                *status = CommitStatus::InProgressAndDirty;
+            }
+            CommitStatus::InProgressAndDirty => {
+                // Already queued; additional triggers in this frame are absorbed.
             }
         }
     });
@@ -117,41 +129,18 @@ pub(super) fn handle_commit_trigger(ecs: &mut World) {
         return;
     }
 
-    let connection = if let Some(conn) = requested_connection {
-        conn
-    } else {
-        let err = PersistenceError::new("TriggerCommit missing target_connection");
+    let connection = connection.expect("first TriggerCommit always sets connection");
+    let store = store.expect("first TriggerCommit always sets store");
+    if store.is_empty() {
+        let err = PersistenceError::new("TriggerCommit store must be non-empty");
         ecs.write_message(CommitCompleted {
             result: Err(err.clone()),
             dirty_entities: vec![],
             correlation_id,
         });
-        bevy::log::error!(%err, "failed to select database connection before commit");
+        bevy::log::error!(%err, "invalid store for commit");
         return;
-    };
-
-    let store = if let Some(store) = requested_store {
-        if store.is_empty() {
-            let err = PersistenceError::new("TriggerCommit store must be non-empty");
-            ecs.write_message(CommitCompleted {
-                result: Err(err.clone()),
-                dirty_entities: vec![],
-                correlation_id,
-            });
-            bevy::log::error!(%err, "invalid store for commit");
-            return;
-        }
-        store
-    } else {
-        let err = PersistenceError::new("TriggerCommit missing store");
-        ecs.write_message(CommitCompleted {
-            result: Err(err.clone()),
-            dirty_entities: vec![],
-            correlation_id,
-        });
-        bevy::log::error!(%err, "failed to select store before commit");
-        return;
-    };
+    }
 
     // 1) isolate dirty sets from the session
     let (dirty_entity_components, despawned_entities, dirty_resources, despawned_resources, dirty_relationship_entities) = {
@@ -160,7 +149,7 @@ pub(super) fn handle_commit_trigger(ecs: &mut World) {
     };
 
     // 2) prepare commit with those sets
-    let commit_data = match PersistenceSession::_prepare_commit(
+    let commit_data = match PersistenceSession::prepare_commit(
         ecs.resource::<PersistenceSession>(),
         ecs,
         &dirty_entity_components,
@@ -179,7 +168,7 @@ pub(super) fn handle_commit_trigger(ecs: &mut World) {
                 correlation_id,
             });
             let mut session = ecs.resource_mut::<PersistenceSession>();
-            session.restore_dirty_state(DirtyState::from_parts_with_relationships(
+            session.restore_dirty_state(DirtyState::from_parts(
                 dirty_entity_components,
                 despawned_entities,
                 dirty_resources,
@@ -196,7 +185,7 @@ pub(super) fn handle_commit_trigger(ecs: &mut World) {
                 correlation_id,
             });
             let mut session = ecs.resource_mut::<PersistenceSession>();
-            session.restore_dirty_state(DirtyState::from_parts_with_relationships(
+            session.restore_dirty_state(DirtyState::from_parts(
                 dirty_entity_components,
                 despawned_entities,
                 dirty_resources,
@@ -208,7 +197,11 @@ pub(super) fn handle_commit_trigger(ecs: &mut World) {
     };
 
     // 3) spawn the async DB transaction
-    *ecs.resource_mut::<CommitStatus>() = CommitStatus::InProgress;
+    *ecs.resource_mut::<CommitStatus>() = if queue_follow_up {
+        CommitStatus::InProgressAndDirty
+    } else {
+        CommitStatus::InProgress
+    };
     let runtime = ecs.resource::<TokioRuntime>().runtime.clone();
     let db = connection.clone();
 
@@ -487,5 +480,6 @@ fn restore_dirty_state_on_failure(session: &mut PersistenceSession, meta: &mut C
         despawned_entities,
         dirty_resources,
         despawned_resources,
+        HashSet::new(),
     ));
 }

@@ -4,16 +4,20 @@
 pub use bevy_persistence_database_derive::persist;
 
 // Re-export commonly used types at the crate root
-pub use crate::bevy::registration::{register_persist_component, register_persist_resource, apply_registered_persist_types};
+pub use crate::bevy::plugins::persistence_plugin::PersistencePluginConfig;
+pub use crate::bevy::registration::{
+    apply_registered_persist_types, register_persist_component, register_persist_resource,
+};
 pub use crate::bevy::spawn::{PersistSpawnCommandsExt, PersistSpawnWorldExt};
 #[cfg(not(feature = "bevy_many_relationship_edges"))]
 pub use crate::bevy::registration::register_persist_bevy_relationship;
 #[cfg(feature = "bevy_many_relationship_edges")]
 pub use crate::bevy::registration::register_persist_many_relationship;
 
+/// Compact encoding helpers. Session serializers apply these automatically when
+/// postcard size exceeds [`PersistencePluginConfig::compact_threshold_bytes`].
+/// Manual `serde(with)` / [`compact::CompactJson`] remain available as force-compact.
+pub use crate::core::compact;
+
 pub mod bevy;
 pub mod core;
-
-
-
-

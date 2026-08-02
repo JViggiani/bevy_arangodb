@@ -1,6 +1,5 @@
 use bevy::prelude::{App, Resource, TaskPoolPlugin};
-use once_cell::sync::Lazy;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::runtime::Runtime;
 
 pub(crate) fn ensure_task_pools(app: &mut App) {
@@ -9,12 +8,12 @@ pub(crate) fn ensure_task_pools(app: &mut App) {
     }
 }
 
-static TOKIO_RUNTIME: Lazy<Arc<Runtime>> = Lazy::new(|| {
+static TOKIO_RUNTIME: LazyLock<Arc<Runtime>> = LazyLock::new(|| {
     Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .unwrap(),
+            .expect("failed to build persistence Tokio runtime"),
     )
 });
 

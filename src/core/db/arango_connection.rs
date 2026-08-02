@@ -75,6 +75,13 @@ impl Default for ArangoAuthRefresh {
     }
 }
 
+/// Default stream-transaction size request sent on each begin-transaction call (512 MiB).
+///
+/// Must not exceed the ArangoDB server ceiling
+/// `--transaction.streaming-max-transaction-size`. Dicemind keeps both sides in
+/// sync via the shared `ARANGO_STREAMING_MAX_TRANSACTION_SIZE` env / ConfigMap.
+pub const DEFAULT_MAX_TRANSACTION_SIZE_BYTES: usize = 512 * 1024 * 1024;
+
 /// Configuration for establishing an Arango connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArangoConnectionConfig {
@@ -84,6 +91,9 @@ pub struct ArangoConnectionConfig {
     pub database: String,
     pub auth_mode: ArangoAuthMode,
     pub refresh: ArangoAuthRefresh,
+    /// Per-transaction `maxTransactionSize` (bytes) requested when beginning a
+    /// stream transaction. Defaults to [`DEFAULT_MAX_TRANSACTION_SIZE_BYTES`].
+    pub max_transaction_size: usize,
 }
 
 impl ArangoConnectionConfig {
@@ -100,6 +110,7 @@ impl ArangoConnectionConfig {
             database: database.into(),
             auth_mode: ArangoAuthMode::Jwt,
             refresh: ArangoAuthRefresh::OnAuthError,
+            max_transaction_size: DEFAULT_MAX_TRANSACTION_SIZE_BYTES,
         }
     }
 }
@@ -751,8 +762,13 @@ impl DatabaseConnection for ArangoDbConnection {
                 let collections = TransactionCollections::builder()
                     .write(write_collections)
                     .build();
+                // Large compact-encoded resources plus geography entities can
+                // exceed Arango's historical 128 MiB default streaming ceiling;
+                // callers raise the server flag to match
+                // `max_transaction_size` (see DEFAULT_MAX_TRANSACTION_SIZE_BYTES).
                 let settings = TransactionSettings::builder()
                     .collections(collections)
+                    .max_transaction_size(conn.config.max_transaction_size)
                     .build();
 
                 let trx = db
@@ -1361,5 +1377,23 @@ mod tests {
         assert!(aql.contains("doc.`Health`"));
         assert!(aql.contains("doc.`Position`"));
         assert!(!aql.contains("RETURN MERGE(doc,"));
+    }
+
+    // GIVEN ArangoConnectionConfig::new with only endpoint/creds/database
+    // WHEN the config is inspected
+    // THEN max_transaction_size defaults to DEFAULT_MAX_TRANSACTION_SIZE_BYTES (512 MiB)
+    #[test]
+    fn connection_config_defaults_max_transaction_size() {
+        let config = ArangoConnectionConfig::new(
+            "http://localhost:8529",
+            "root",
+            "password",
+            "world_engine",
+        );
+        assert_eq!(
+            config.max_transaction_size,
+            DEFAULT_MAX_TRANSACTION_SIZE_BYTES
+        );
+        assert_eq!(config.max_transaction_size, 512 * 1024 * 1024);
     }
 }

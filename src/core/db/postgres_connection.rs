@@ -928,7 +928,7 @@ impl DatabaseConnection for PostgresDbConnection {
 
             // Entity creates
             if !groups.entities.creates.is_empty() {
-                // Extract client-side keys from the document data (pre-assigned by _prepare_commit).
+                // Extract client-side keys from the document data (pre-assigned by prepare_commit).
                 // Fall back to UUID v4 if a document is missing its key (shouldn't happen).
                 let ids: Vec<String> = groups
                     .entities.creates

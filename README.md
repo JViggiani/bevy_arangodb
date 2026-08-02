@@ -158,6 +158,7 @@ app.add_plugins(PersistencePlugins::new(db.clone()).with_config(config));
 
 - `thread_count`: Rayon pool size used for parallel commit preparation (serialization).
 - `default_store`: fallback store when queries/commits don’t override `.store()`.
+- `compact_threshold_bytes`: auto-compact large JSON values (see `bevy_persistence_database::compact`).
 
 Load-induced dirty flags are suppressed automatically during hydration ([`PersistenceSession::materialize_entity_document`], [`PersistenceSession::materialize_resource`], and related load APIs open a scope; PostUpdate [`PersistenceSystemSet::FinishHydration`] closes it after dirty tracking). Use [`PersistenceQuery::reconcile_versions`](crate::bevy::query::PersistenceQuery::reconcile_versions) manually after ops/migration if the in-memory version cache must be realigned to the database.
 

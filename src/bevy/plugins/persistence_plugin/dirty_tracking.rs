@@ -1,4 +1,3 @@
-use crate::bevy::components::Guid;
 #[cfg(test)]
 use crate::core::persist::Persist;
 use crate::core::session::PersistenceSession;
@@ -6,27 +5,25 @@ use bevy::prelude::*;
 use std::any::TypeId;
 
 /// Automatically marks entities with added/changed components as dirty.
+///
+/// Bevy treats `Added` as a subset of `Changed`, so one `Changed` query is enough.
+/// The `Added` query is only used to tell hydration suppression whether the change
+/// is an insert-in-the-same-frame (see [`PersistenceSession::track_component_changed`]).
 pub fn auto_dirty_tracking_entity_system<T: Component + 'static>(
     mut session: ResMut<PersistenceSession>,
     changed: Query<Entity, Changed<T>>,
     added: Query<Entity, Added<T>>,
 ) {
     let type_id = TypeId::of::<T>();
-    for entity in changed.iter() {
+    for entity in &changed {
+        let also_added = added.contains(entity);
         bevy::log::debug!(
-            "Marking entity {:?} as dirty due to changed component {}",
+            "Marking entity {:?} as dirty due to {} component {}",
             entity,
+            if also_added { "added" } else { "changed" },
             std::any::type_name::<T>()
         );
-        session.track_component_changed(entity, type_id, added.contains(entity));
-    }
-    for entity in added.iter() {
-        bevy::log::debug!(
-            "Marking entity {:?} as dirty due to added component {}",
-            entity,
-            std::any::type_name::<T>()
-        );
-        session.track_component_added(entity, type_id);
+        session.track_component_changed(entity, type_id, also_added);
     }
 }
 
@@ -92,32 +89,6 @@ pub fn auto_dirty_tracking_relationship_system<R: Send + Sync + 'static>(
             std::any::type_name::<R>()
         );
         session.track_relationship_entity_changed(entity);
-    }
-}
-
-/// Detects removal of persisted resources and marks them for deletion.
-pub(crate) fn auto_despawn_tracking_resource_system(ecs: &mut World) {
-    let presence_snapshot = {
-        let session = ecs.resource::<PersistenceSession>();
-        session.resource_presence_snapshot(ecs)
-    };
-
-    let mut session = ecs.resource_mut::<PersistenceSession>();
-    for (type_id, is_present) in presence_snapshot {
-        let was_present = session.update_resource_presence(type_id, is_present);
-        if was_present && !is_present {
-            session.mark_resource_despawned_type_id(type_id);
-        }
-    }
-}
-
-/// Automatically marks despawned entities as needing deletion.
-pub(crate) fn auto_despawn_tracking_system(
-    mut session: ResMut<PersistenceSession>,
-    mut removed: RemovedComponents<Guid>,
-) {
-    for entity in removed.read() {
-        session.mark_despawned(entity);
     }
 }
 

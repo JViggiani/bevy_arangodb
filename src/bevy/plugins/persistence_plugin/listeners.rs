@@ -42,21 +42,18 @@ pub(super) fn commit_event_listener(
     mut listeners: bevy::prelude::ResMut<CommitEventListeners>,
 ) {
     for event in events.read() {
-        if let Some(id) = event.correlation_id {
-            if let Some(sender) = listeners.listeners.remove(&id) {
-                bevy::log::debug!("Found listener for commit {}. Sending result.", id);
-                let result = match &event.result {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(e.clone()),
-                };
-                let _ = sender.send(result);
-            } else {
-                // This can be expected when multi-batch commit tracking consumes the
-                // listener up front, or when a correlation id is used without a listener.
-                bevy::log::debug!("Commit listener missing for correlation_id={}", id);
-            }
-        } else {
+        let Some(id) = event.correlation_id else {
             bevy::log::trace!("CommitCompleted event without correlation id consumed");
-        }
+            continue;
+        };
+        let Some(sender) = listeners.listeners.remove(&id) else {
+            // Expected when multi-batch commit tracking consumes the listener up front,
+            // or when a correlation id is used without a listener.
+            bevy::log::debug!("Commit listener missing for correlation_id={id}");
+            continue;
+        };
+        bevy::log::debug!("Found listener for commit {id}. Sending result.");
+        let result = event.result.as_ref().map(|_| ()).map_err(Clone::clone);
+        let _ = sender.send(result);
     }
 }

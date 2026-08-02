@@ -1,35 +1,28 @@
 use bevy::prelude::{App, ResMut, World};
 
-use crate::bevy::world_access::{DeferredWorldOperations, ImmediateWorldPtr};
-use crate::core::session::PersistenceSession;
+use crate::{
+    bevy::world_access::{DeferredWorldOperations, ImmediateWorldPtr},
+    core::session::PersistenceSession,
+};
 
 pub(crate) fn insert_initial_immediate_world_ptr(app: &mut App) {
-    let ptr: *mut World = app.world_mut() as *mut World;
+    let world = app.world_mut();
     bevy::log::trace!(
         "PersistencePluginCore: inserting initial ImmediateWorldPtr {:p}",
-        ptr
+        world as *mut World,
     );
-    if app.world().get_resource::<ImmediateWorldPtr>().is_none() {
-        app.insert_resource(ImmediateWorldPtr::new(ptr));
-    } else {
-        app.world_mut().resource_mut::<ImmediateWorldPtr>().set(ptr);
-    }
+    ImmediateWorldPtr::publish(world);
 }
 
 /// Publishes the current world pointer so other systems can materialize results immediately.
 pub(crate) fn publish_immediate_world_ptr(world: &mut World) {
-    let ptr: *mut World = world as *mut World;
-    if world.get_resource::<ImmediateWorldPtr>().is_none() {
-        world.insert_resource(ImmediateWorldPtr::new(ptr));
-    } else {
-        world.resource_mut::<ImmediateWorldPtr>().set(ptr);
-    }
+    ImmediateWorldPtr::publish(world);
 }
 
 /// Applies queued world mutations (e.g. entity spawns, component inserts) for this frame.
 pub(crate) fn apply_deferred_world_ops(world: &mut World) {
-    let mut pending = world.resource::<DeferredWorldOperations>().drain();
-    for op in pending.drain(..) {
+    let pending = world.resource::<DeferredWorldOperations>().drain();
+    for op in pending {
         op(world);
     }
 }
@@ -74,6 +67,9 @@ mod tests {
         difficulty: Option<f32>,
     }
 
+    // GIVEN a PersistencePlugins app relocated in memory after construction
+    // WHEN a PersistentRes system runs on the next update
+    // THEN ImmediateWorldPtr still hydrates the resource successfully
     #[test]
     fn refreshes_immediate_world_ptr_before_startup_after_app_move() {
         let mut db = MockDatabaseConnection::new();
