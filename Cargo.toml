@@ -55,6 +55,7 @@ deadpool-postgres = { version = "0.14", optional = true }
 bevy_many_relationships = { version = "0.3.0", path = "../bevy_many_relationships", optional = true }
 base64 = "0.22"
 postcard = { version = "1", default-features = true, features = ["use-std"] }
+serde_path_to_error = "0.1"
 zstd = "0.13"
 
 [features]

@@ -80,13 +80,38 @@ pub fn encode_postcard_bytes(raw: &[u8], zstd_level: i32) -> Result<String, Comp
 }
 
 /// Inverse of [`encode`].
+///
+/// Decodes via [`serde_path_to_error`] rather than plain `postcard::from_bytes`:
+/// postcard's `Error::custom` variant discards the message serde attaches to it
+/// (see `postcard::Error::SerdeDeCustom`), so every schema-mismatch failure
+/// anywhere in a large nested type otherwise collapses to the same generic
+/// "Serde Deserialization Error" with no indication of which field broke.
+///
+/// Postcard structs are wire-encoded as plain sequences (no field names on the
+/// wire — that's what makes the format compact), so `serde_path_to_error` can
+/// only report *positional* segments here, e.g. `[3][0]` meaning "4th field of
+/// the outer struct, then 1st field of that nested struct" — cross-reference
+/// against each struct's field declaration order to find the actual field.
+/// Still a large improvement: it narrows a schema mismatch anywhere inside a
+/// large nested type (e.g. `WorldGenerationOutput`) down to one exact path
+/// instead of a blind bisection through the whole struct tree.
+///
+/// Note on schema evolution: `#[serde(default)]` on a trailing field does **not**
+/// make postcard payloads backward-compatible when that type lives inside a
+/// `Vec<_>` (or any sequence). After one element's fields there is still more
+/// buffer — the next element — so the decoder cannot tell a field is "missing"
+/// and will consume the neighbour's bytes instead. Prefer `#[serde(skip)]` for
+/// runtime-only extensions, or an explicit versioned migration, before adding
+/// new persisted fields to sequence elements.
 pub fn decode<T: DeserializeOwned>(payload: &str) -> Result<T, CompactError> {
     let compressed = BASE64
         .decode(payload.as_bytes())
         .map_err(|e| CompactError(format!("base64 decode: {e}")))?;
     let raw = zstd::decode_all(compressed.as_slice())
         .map_err(|e| CompactError(format!("zstd decode: {e}")))?;
-    postcard::from_bytes(&raw).map_err(|e| CompactError(format!("postcard decode: {e}")))
+    let mut deserializer = postcard::Deserializer::from_bytes(&raw);
+    serde_path_to_error::deserialize(&mut deserializer)
+        .map_err(|e| CompactError(format!("postcard decode at `{}`: {}", e.path(), e.inner())))
 }
 
 /// Build a JSON [`Value`] for persistence: compact envelope when postcard size
@@ -277,6 +302,60 @@ mod tests {
         let value = to_persist_value(&original, DEFAULT_COMPACT_THRESHOLD_BYTES).unwrap();
         assert!(!is_compact_envelope(&value));
         assert_eq!(from_persist_value::<Sample>(value).unwrap(), original);
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    struct Outer {
+        name: String,
+        inner: Inner,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    struct Inner {
+        grid_size: usize,
+    }
+
+    // Deliberately mismatched vs. `Inner`'s wire shape: postcard is not
+    // self-describing, so a struct field renamed/retyped between encode and
+    // decode does not fail loudly on its own — it only surfaces once some
+    // downstream deserializer (here `NonZeroUsize`) rejects the misread bytes.
+    #[allow(dead_code)]
+    #[derive(Debug, Deserialize)]
+    struct MismatchedOuter {
+        name: String,
+        inner: MismatchedInner,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, Deserialize)]
+    struct MismatchedInner {
+        grid_size: std::num::NonZeroUsize,
+    }
+
+    // GIVEN a compact payload whose nested field no longer matches the
+    // decode-side schema (postcard's own error discards this detail — see
+    // `postcard::Error::SerdeDeCustom`)
+    // WHEN decode fails
+    // THEN the error names the exact positional field path (`[1][0]` = 2nd
+    // field of the outer struct, 1st field of that nested struct) so a schema
+    // mismatch buried anywhere in a large nested type (e.g.
+    // `WorldGenerationOutput`) can be found in seconds instead of bisected by
+    // hand
+    #[test]
+    fn decode_error_reports_failing_field_path() {
+        let original = Outer {
+            name: "world".into(),
+            inner: Inner { grid_size: 0 },
+        };
+        let payload = encode(&original).expect("encode");
+
+        let err = decode::<MismatchedOuter>(&payload).unwrap_err();
+
+        assert!(
+            err.0.contains("[1][0]"),
+            "expected error to name the failing positional field path, got: {}",
+            err.0
+        );
     }
 
     // GIVEN a large value and a low threshold
