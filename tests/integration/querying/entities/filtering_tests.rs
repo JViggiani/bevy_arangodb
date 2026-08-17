@@ -18,15 +18,14 @@ fn assert_health_filter_count(
     expected: usize,
 ) {
     let mut app = setup_test_app(db, None);
-    app.add_systems(bevy::prelude::Update, move |pq: PersistentQuery<&Health>| {
-        let _ = pq.filter(filter.clone()).load();
-    });
+    app.add_systems(
+        bevy::prelude::Update,
+        move |pq: PersistentQuery<&Health>| {
+            let _ = pq.filter(filter.clone()).load();
+        },
+    );
     app.update();
-    let count = app
-        .world_mut()
-        .query::<&Health>()
-        .iter(app.world())
-        .count();
+    let count = app.world_mut().query::<&Health>().iter(app.world()).count();
     assert_eq!(count, expected);
 }
 
@@ -36,9 +35,12 @@ fn assert_creature_filter_count(
     expected: usize,
 ) {
     let mut app = setup_test_app(db, None);
-    app.add_systems(bevy::prelude::Update, move |pq: PersistentQuery<&Creature>| {
-        let _ = pq.filter(filter.clone()).load();
-    });
+    app.add_systems(
+        bevy::prelude::Update,
+        move |pq: PersistentQuery<&Creature>| {
+            let _ = pq.filter(filter.clone()).load();
+        },
+    );
     app.update();
     let count = app
         .world_mut()
@@ -54,9 +56,12 @@ fn assert_player_name_filter_count(
     expected: usize,
 ) {
     let mut app = setup_test_app(db, None);
-    app.add_systems(bevy::prelude::Update, move |pq: PersistentQuery<&PlayerName>| {
-        let _ = pq.filter(filter.clone()).load();
-    });
+    app.add_systems(
+        bevy::prelude::Update,
+        move |pq: PersistentQuery<&PlayerName>| {
+            let _ = pq.filter(filter.clone()).load();
+        },
+    );
     app.update();
     let count = app
         .world_mut()

@@ -21,7 +21,12 @@ mod many_relationship_edges {
     use crate::common::*;
     use bevy_persistence_database_derive::db_matrix_test;
 
-    fn seed_friendship(db: &Arc<dyn DatabaseConnection>, strength: f32, guid_a: &str, guid_b: &str) {
+    fn seed_friendship(
+        db: &Arc<dyn DatabaseConnection>,
+        strength: f32,
+        guid_a: &str,
+        guid_b: &str,
+    ) {
         let mut app = setup_test_app(db.clone(), None);
         app.add_plugins(ManyRelationshipsPlugin);
 
@@ -80,7 +85,10 @@ mod many_relationship_edges {
                 break;
             }
         }
-        assert!(found, "hydrator should load outgoing friendship relationships");
+        assert!(
+            found,
+            "hydrator should load outgoing friendship relationships"
+        );
     }
 
     /// `PersistentQuery::with_relationship_depth` loads both entities and their
@@ -93,9 +101,7 @@ mod many_relationship_edges {
         let mut reader_app = setup_test_app(db.clone(), None);
         reader_app.add_plugins(ManyRelationshipsPlugin);
         reader_app.add_systems(Update, |query: PersistentQuery<&Health>| {
-            query
-                .with_relationship_depth::<Friendship>(1)
-                .load();
+            query.with_relationship_depth::<Friendship>(1).load();
         });
 
         reader_app.update();
@@ -205,7 +211,9 @@ mod bevy_native {
 
         // Insert relationship immediately — dirty tracking fires on the next update.
         // Both entities and the edge are committed in a single call.
-        app.world_mut().entity_mut(src).insert(MemberOf { team: tgt });
+        app.world_mut()
+            .entity_mut(src)
+            .insert(MemberOf { team: tgt });
         app.update();
         commit_sync(&mut app, db.clone(), TEST_STORE).expect("seed commit failed");
     }
@@ -240,14 +248,26 @@ mod bevy_native {
         let src_entity = {
             let mut q = reader_app.world_mut().query::<(Entity, &Guid)>();
             q.iter(reader_app.world())
-                .find_map(|(e, g)| if g.id() == "native_src" { Some(e) } else { None })
+                .find_map(|(e, g)| {
+                    if g.id() == "native_src" {
+                        Some(e)
+                    } else {
+                        None
+                    }
+                })
                 .expect("source entity should be loaded from DB")
         };
 
         let tgt_entity = {
             let mut q = reader_app.world_mut().query::<(Entity, &Guid)>();
             q.iter(reader_app.world())
-                .find_map(|(e, g)| if g.id() == "native_tgt" { Some(e) } else { None })
+                .find_map(|(e, g)| {
+                    if g.id() == "native_tgt" {
+                        Some(e)
+                    } else {
+                        None
+                    }
+                })
                 .expect("target entity should be loaded from DB")
         };
 
@@ -319,4 +339,5 @@ mod bevy_native {
             member_of.team, tgt_entity,
             "schedule_load should eventually materialise the native relationship"
         );
-    }}
+    }
+}

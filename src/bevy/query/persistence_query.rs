@@ -267,13 +267,7 @@ impl PersistenceQuery {
                     key
                 );
                 let entity = session
-                    .materialize_entity_document(
-                        world,
-                        &doc,
-                        key_field,
-                        &explicit_components,
-                        true,
-                    )
+                    .materialize_entity_document(world, &doc, key_field, &explicit_components, true)
                     .expect("component deserialization failed")
                     .expect("document key should be present");
 
@@ -550,9 +544,7 @@ mod tests {
         app.add_plugins(PersistencePluginCore::new(db.clone()));
 
         {
-            let mut session = app
-                .world_mut()
-                .resource_mut::<PersistenceSession>();
+            let mut session = app.world_mut().resource_mut::<PersistenceSession>();
             session.register_component::<Health>();
             session.register_component::<Position>();
         }
@@ -597,7 +589,10 @@ mod tests {
         struct Comp1;
 
         let db = Arc::new(MockDatabaseConnection::new());
-        let query = PersistenceQuery::new().with_db(db).store(TEST_STORE).for_component::<Comp1>();
+        let query = PersistenceQuery::new()
+            .with_db(db)
+            .store(TEST_STORE)
+            .for_component::<Comp1>();
         let spec = query.build_spec();
 
         assert!(!spec.presence_with.is_empty());

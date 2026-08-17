@@ -3,15 +3,15 @@ use std::marker::PhantomData;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::{Mut, Resource, World};
 
+use super::resource_thread_local::{
+    set_resource_force_refresh, set_resource_store, take_resource_force_refresh,
+    take_resource_store,
+};
 use crate::bevy::plugins::persistence_plugin::{PersistencePluginConfig, TokioRuntime};
 use crate::bevy::world_access::ImmediateWorldPtr;
 use crate::core::db::connection::DatabaseConnectionResource;
 use crate::core::persist::Persist;
 use crate::core::session::PersistenceSession;
-use super::resource_thread_local::{
-    set_resource_force_refresh, set_resource_store, take_resource_force_refresh,
-    take_resource_store,
-};
 
 fn load_registered_resource<T: Resource + Persist>(
     session: &mut PersistenceSession,
@@ -165,8 +165,8 @@ impl<'w, T: Resource + Persist> PersistentResMut<'w, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::db::{MockDatabaseConnection, connection::DatabaseConnectionResource};
     use crate::bevy::plugins::persistence_plugin::TokioRuntime;
+    use crate::core::db::{MockDatabaseConnection, connection::DatabaseConnectionResource};
     use bevy::prelude::App;
     use bevy::prelude::MinimalPlugins;
     use bevy_persistence_database_derive::persist;
@@ -301,9 +301,7 @@ mod tests {
         app.update();
 
         let session = app.world().get_resource::<PersistenceSession>().unwrap();
-        assert!(
-            session.is_resource_dirty(std::any::TypeId::of::<TestResource>())
-        );
+        assert!(session.is_resource_dirty(std::any::TypeId::of::<TestResource>()));
     }
 
     #[test]
@@ -360,9 +358,12 @@ mod tests {
         app.insert_resource(session);
         init_world_ptr(&mut app);
 
-        app.add_systems(bevy::prelude::Update, |mut res: PersistentRes<TestResource>| {
-            let _ = res.get();
-        });
+        app.add_systems(
+            bevy::prelude::Update,
+            |mut res: PersistentRes<TestResource>| {
+                let _ = res.get();
+            },
+        );
 
         app.update();
 

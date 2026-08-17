@@ -73,10 +73,9 @@ mod tests {
     #[test]
     fn refreshes_immediate_world_ptr_before_startup_after_app_move() {
         let mut db = MockDatabaseConnection::new();
-        db.expect_fetch_resource()
-            .returning(|_, _| Box::pin(async {
-                Ok(Some((json!({ "difficulty": 0.3, "map_name": "moved" }), 1)))
-            }));
+        db.expect_fetch_resource().returning(|_, _| {
+            Box::pin(async { Ok(Some((json!({ "difficulty": 0.3, "map_name": "moved" }), 1))) })
+        });
         db.expect_document_key_field().return_const("_key");
 
         let mut app = App::new();

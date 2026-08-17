@@ -1,7 +1,7 @@
+use bevy_persistence_database::core::db::connection::EdgeDocument;
 use bevy_persistence_database::core::db::{
     DatabaseConnection, DocumentKind, PersistenceError, TransactionOperation,
 };
-use bevy_persistence_database::core::db::connection::EdgeDocument;
 use bevy_persistence_database::core::query::{
     EdgeQuerySpecification, PersistenceQuerySpecification,
 };

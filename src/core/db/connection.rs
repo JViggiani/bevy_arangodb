@@ -108,10 +108,7 @@ pub enum TransactionOperation {
         edges: Vec<EdgeDocument>,
     },
     /// Delete a batch of edges by their deterministic keys from `{store}__edges`.
-    DeleteEdges {
-        store: String,
-        keys: Vec<String>,
-    },
+    DeleteEdges { store: String, keys: Vec<String> },
 }
 
 /// A single edge document for relationship persistence.

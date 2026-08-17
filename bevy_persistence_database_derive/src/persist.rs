@@ -48,8 +48,7 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                         PersistKind::Relationship => unreachable!(),
                     };
                     if is_single_field {
-                        s.attrs
-                            .push(syn::parse_quote!(#[derive(#bevy_derive)]));
+                        s.attrs.push(syn::parse_quote!(#[derive(#bevy_derive)]));
                         single_field_serde = single_field_serde_tokens(s);
                     } else {
                         s.attrs.push(syn::parse_quote!(

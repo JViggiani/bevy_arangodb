@@ -43,22 +43,24 @@ impl<'w, 's> PersistenceRelationshipHydrator<'w, 's> {
         };
 
         let world = ptr.as_world_mut();
-        world.resource_scope(|world, mut session: bevy::prelude::Mut<PersistenceSession>| {
-            let Some(rel_name) = session.relationship_type_name(&TypeId::of::<R>()) else {
-                return;
-            };
-            let spec = self.build_spec(
-                world,
-                &mut session,
-                vec![TypeId::of::<R>()],
-                entities,
-                depth,
-                rel_name,
-            );
-            if let Some(spec) = spec {
-                self.run_spec(world, &mut session, spec, entities, depth);
-            }
-        });
+        world.resource_scope(
+            |world, mut session: bevy::prelude::Mut<PersistenceSession>| {
+                let Some(rel_name) = session.relationship_type_name(&TypeId::of::<R>()) else {
+                    return;
+                };
+                let spec = self.build_spec(
+                    world,
+                    &mut session,
+                    vec![TypeId::of::<R>()],
+                    entities,
+                    depth,
+                    rel_name,
+                );
+                if let Some(spec) = spec {
+                    self.run_spec(world, &mut session, spec, entities, depth);
+                }
+            },
+        );
 
         world.flush();
     }
@@ -73,23 +75,32 @@ impl<'w, 's> PersistenceRelationshipHydrator<'w, 's> {
         };
 
         let world = ptr.as_world_mut();
-        world.resource_scope(|world, mut session: bevy::prelude::Mut<PersistenceSession>| {
-            let all_types: Vec<TypeId> = session
-                .relationship_type_entries()
-                .into_iter()
-                .map(|(type_id, _)| type_id)
-                .collect();
+        world.resource_scope(
+            |world, mut session: bevy::prelude::Mut<PersistenceSession>| {
+                let all_types: Vec<TypeId> = session
+                    .relationship_type_entries()
+                    .into_iter()
+                    .map(|(type_id, _)| type_id)
+                    .collect();
 
-            for type_id in all_types {
-                let Some(rel_name) = session.relationship_type_name(&type_id) else {
-                    continue;
-                };
-                let spec = self.build_spec(world, &mut session, vec![type_id], entities, depth, rel_name);
-                if let Some(spec) = spec {
-                    self.run_spec(world, &mut session, spec, entities, depth);
+                for type_id in all_types {
+                    let Some(rel_name) = session.relationship_type_name(&type_id) else {
+                        continue;
+                    };
+                    let spec = self.build_spec(
+                        world,
+                        &mut session,
+                        vec![type_id],
+                        entities,
+                        depth,
+                        rel_name,
+                    );
+                    if let Some(spec) = spec {
+                        self.run_spec(world, &mut session, spec, entities, depth);
+                    }
                 }
-            }
-        });
+            },
+        );
 
         world.flush();
     }
@@ -190,10 +201,17 @@ impl<'w, 's> PersistenceRelationshipHydrator<'w, 's> {
         let Some(type_name) = spec.relationship_types.first() else {
             return;
         };
-        let Some(type_id) = session
-            .relationship_type_entries()
-            .into_iter()
-            .find_map(|(type_id, name)| if name == type_name { Some(type_id) } else { None })
+        let Some(type_id) =
+            session
+                .relationship_type_entries()
+                .into_iter()
+                .find_map(|(type_id, name)| {
+                    if name == type_name {
+                        Some(type_id)
+                    } else {
+                        None
+                    }
+                })
         else {
             return;
         };

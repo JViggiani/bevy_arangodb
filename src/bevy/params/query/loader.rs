@@ -1,12 +1,12 @@
+use super::cache::CachePolicy;
+use super::persistence_query_system_param::PersistentQuery;
+use super::query_thread_local::{RelationshipLoadSpec, take_pagination_config};
 use crate::bevy::plugins::persistence_plugin::TokioRuntime;
 use crate::core::db::connection::DocumentKind;
 use crate::core::query::{
     EdgeQuerySpecification, FilterExpression, PaginationConfig, PersistenceQuerySpecification,
 };
 use crate::core::session::PersistenceSession;
-use super::cache::CachePolicy;
-use super::persistence_query_system_param::PersistentQuery;
-use super::query_thread_local::{RelationshipLoadSpec, take_pagination_config};
 use bevy::ecs::query::{QueryData, QueryFilter};
 use bevy::prelude::{Entity, Mut, World};
 use rayon::prelude::*;
@@ -23,13 +23,7 @@ impl<'w, 's, Q: QueryData + 'static, F: QueryFilter + 'static> PersistentQuery<'
         allow_overwrite: bool,
         key_field: &str,
     ) {
-        match session.materialize_entity_document(
-            world,
-            doc,
-            key_field,
-            comps,
-            allow_overwrite,
-        ) {
+        match session.materialize_entity_document(world, doc, key_field, comps, allow_overwrite) {
             Ok(None) => {
                 bevy::log::trace!(
                     "apply_one_document: skipping doc missing key '{}'",
@@ -264,10 +258,7 @@ impl<'w, 's, Q: QueryData + 'static, F: QueryFilter + 'static> PersistentQuery<'
                                 }
 
                                 // Fetch resources once alongside the entity loads.
-                                let rt = world
-                                    .resource::<TokioRuntime>()
-                                    .runtime
-                                    .clone();
+                                let rt = world.resource::<TokioRuntime>().runtime.clone();
                                 let db = self.db.connection.clone();
                                 bevy::log::trace!("PQ::immediate_apply: fetching resources");
                                 rt.block_on(
@@ -277,15 +268,17 @@ impl<'w, 's, Q: QueryData + 'static, F: QueryFilter + 'static> PersistentQuery<'
                             });
 
                             if !relationship_spec.is_empty() {
-                                world.resource_scope(|world, mut session: Mut<PersistenceSession>| {
-                                    self.load_relationships_for_keys(
-                                        world,
-                                        &mut session,
-                                        &store,
-                                        &loaded_keys,
-                                        relationship_spec,
-                                    );
-                                });
+                                world.resource_scope(
+                                    |world, mut session: Mut<PersistenceSession>| {
+                                        self.load_relationships_for_keys(
+                                            world,
+                                            &mut session,
+                                            &store,
+                                            &loaded_keys,
+                                            relationship_spec,
+                                        );
+                                    },
+                                );
                             }
 
                             bevy::log::trace!("PQ::immediate_apply: world.flush()");
@@ -321,15 +314,19 @@ impl<'w, 's, Q: QueryData + 'static, F: QueryFilter + 'static> PersistentQuery<'
                             // Also fetch resources alongside any query (deferred)
                             let db = self.db.connection.clone();
                             self.ops.push(Box::new(move |world: &mut World| {
-                                world.resource_scope(|world, mut session: Mut<PersistenceSession>| {
-                                    let rt = world
-                                        .resource::<TokioRuntime>()
-                                        .runtime
-                                        .clone();
-                                    bevy::log::trace!("PQ::execute_combined_load: fetching resources");
-                                    // Use db directly rather than dereferencing it
-                                    rt.block_on(session.fetch_and_insert_resources(&*db, &store, world)).ok();
-                                });
+                                world.resource_scope(
+                                    |world, mut session: Mut<PersistenceSession>| {
+                                        let rt = world.resource::<TokioRuntime>().runtime.clone();
+                                        bevy::log::trace!(
+                                            "PQ::execute_combined_load: fetching resources"
+                                        );
+                                        // Use db directly rather than dereferencing it
+                                        rt.block_on(
+                                            session.fetch_and_insert_resources(&*db, &store, world),
+                                        )
+                                        .ok();
+                                    },
+                                );
                             }));
 
                             if !relationship_spec.is_empty() {
@@ -437,7 +434,10 @@ impl<'w, 's, Q: QueryData + 'static, F: QueryFilter + 'static> PersistentQuery<'
             }
         }
 
-        match self.runtime.block_on(self.db.connection.fetch_document(store, key)) {
+        match self
+            .runtime
+            .block_on(self.db.connection.fetch_document(store, key))
+        {
             Ok(Some((doc, _))) => {
                 Self::apply_one_document(world, session, &doc, &[], true, key_field);
                 session.entity_by_key(key)
@@ -485,11 +485,7 @@ impl<'w, 's, Q: QueryData + 'static, F: QueryFilter + 'static> PersistentQuery<'
             let edges = match self.runtime.block_on(self.db.connection.query_edges(&spec)) {
                 Ok(edges) => edges,
                 Err(e) => {
-                    bevy::log::error!(
-                        "Failed loading relationship edges for {}: {}",
-                        rel_name,
-                        e
-                    );
+                    bevy::log::error!("Failed loading relationship edges for {}: {}", rel_name, e);
                     continue;
                 }
             };
@@ -513,9 +509,13 @@ impl<'w, 's, Q: QueryData + 'static, F: QueryFilter + 'static> PersistentQuery<'
                 let raw_targets = grouped.remove(source_key).unwrap_or_default();
                 let mut resolved_targets = Vec::with_capacity(raw_targets.len());
                 for (target_key, payload) in raw_targets {
-                    if let Some(target_entity) =
-                        self.ensure_entity_loaded_by_key(world, session, store, key_field, &target_key)
-                    {
+                    if let Some(target_entity) = self.ensure_entity_loaded_by_key(
+                        world,
+                        session,
+                        store,
+                        key_field,
+                        &target_key,
+                    ) {
                         resolved_targets.push((target_entity, payload));
                     }
                 }

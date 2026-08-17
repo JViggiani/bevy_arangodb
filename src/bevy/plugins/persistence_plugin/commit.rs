@@ -143,7 +143,13 @@ pub(super) fn handle_commit_trigger(ecs: &mut World) {
     }
 
     // 1) isolate dirty sets from the session
-    let (dirty_entity_components, despawned_entities, dirty_resources, despawned_resources, dirty_relationship_entities) = {
+    let (
+        dirty_entity_components,
+        despawned_entities,
+        dirty_resources,
+        despawned_resources,
+        dirty_relationship_entities,
+    ) = {
         let mut session = ecs.resource_mut::<PersistenceSession>();
         session.take_dirty_state().into_parts()
     };
@@ -157,7 +163,8 @@ pub(super) fn handle_commit_trigger(ecs: &mut World) {
         &dirty_resources,
         &despawned_resources,
         &dirty_relationship_entities,
-        ecs.get_resource::<super::plugin::PersistenceThreadPool>().map(|p| p.get()),
+        ecs.get_resource::<super::plugin::PersistenceThreadPool>()
+            .map(|p| p.get()),
         connection.document_key_field(),
         &store,
     ) {
@@ -271,10 +278,7 @@ fn spawn_commit_task(ecs: &mut World, request: CommitRequest) {
     let db_for_task = db.clone();
     let (tx, rx) = oneshot::channel();
     runtime.spawn(async move {
-        bevy::log::trace!(
-            "commit task started ({} operations)",
-            operations.len()
-        );
+        bevy::log::trace!("commit task started ({} operations)", operations.len());
         let res = db_for_task
             .execute_transaction(operations)
             .await
@@ -342,11 +346,7 @@ pub(super) fn handle_commit_completed(
             }
 
             if let Err(err) = &result {
-                bevy::log::error!(
-                    "commit completed with error (cid={:?} err={})",
-                    cid,
-                    err
-                );
+                bevy::log::error!("commit completed with error (cid={:?} err={})", cid, err);
             } else {
                 bevy::log::trace!("commit completed ok (cid={:?})", cid);
             }
@@ -402,7 +402,10 @@ pub(super) fn handle_commit_completed(
                 }
             }
         } else if PENDING_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < 5 {
-            bevy::log::debug!("commit task still pending (cid={:?})", trigger_id.correlation_id);
+            bevy::log::debug!(
+                "commit task still pending (cid={:?})",
+                trigger_id.correlation_id
+            );
         }
     }
 

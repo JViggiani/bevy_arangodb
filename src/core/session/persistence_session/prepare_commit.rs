@@ -6,8 +6,8 @@ use std::{
 };
 
 use bevy::prelude::{Entity, World, debug};
-use rayon::prelude::*;
 use rayon::ThreadPool;
+use rayon::prelude::*;
 use serde_json::Value;
 
 use crate::bevy::components::Guid;
@@ -85,7 +85,6 @@ impl PersistenceSession {
             }
         }
 
-
         // 1) Deletions (order matters less, do sequentially)
         for &entity in despawned_entities {
             if let Some(key) = session.cache.entity_keys.get(&entity) {
@@ -110,7 +109,8 @@ impl PersistenceSession {
                 continue;
             };
             let version_key = VersionKey::Resource(resource_type_id);
-            let Some(current_version) = session.cache.version_manager.get_version(&version_key) else {
+            let Some(current_version) = session.cache.version_manager.get_version(&version_key)
+            else {
                 continue;
             };
             operations.push(TransactionOperation::DeleteDocument {
@@ -123,70 +123,66 @@ impl PersistenceSession {
         }
 
         let serialize_entity = |(&entity, dirty_components): (&Entity, &HashSet<TypeId>)| {
-                let mut data_map = serde_json::Map::new();
-                let mut committed_types = HashSet::new();
+            let mut data_map = serde_json::Map::new();
+            let mut committed_types = HashSet::new();
 
-                let component_type_ids: Vec<TypeId> =
-                    dirty_components.iter().copied().collect();
+            let component_type_ids: Vec<TypeId> = dirty_components.iter().copied().collect();
 
-                for component_type_id in component_type_ids {
-                    let Some(serializer) = session
-                        .components
-                        .serializers
-                        .get(&component_type_id)
-                    else {
-                        continue;
-                    };
-                    if let Some((field_name, value)) = serializer(entity, world)? {
-                        data_map.insert(field_name, value);
-                        committed_types.insert(component_type_id);
-                    }
+            for component_type_id in component_type_ids {
+                let Some(serializer) = session.components.serializers.get(&component_type_id)
+                else {
+                    continue;
+                };
+                if let Some((field_name, value)) = serializer(entity, world)? {
+                    data_map.insert(field_name, value);
+                    committed_types.insert(component_type_id);
                 }
-                if data_map.is_empty() {
-                    return Ok(None);
-                }
-                if let Some(key) = session.cache.entity_keys.get(&entity) {
-                    // update existing
-                    let version_key = VersionKey::Entity(key.clone());
-                    let current_version = session
-                        .cache
-                        .version_manager
-                        .get_version(&version_key)
-                        .ok_or_else(|| PersistenceError::new("Missing version for update"))?;
-                    let next_version = current_version + 1;
-                    insert_meta(&mut data_map, DocumentKind::Entity, next_version);
-                    Ok(Some((
-                        TransactionOperation::UpdateDocument {
-                            store: store.to_string(),
-                            kind: DocumentKind::Entity,
-                            key: key.clone(),
-                            expected_current_version: current_version,
-                            patch: Value::Object(data_map),
-                        },
-                        entity,
-                        committed_types,
-                    )))
-                } else if let Some(key) = preassigned_keys.get(&entity) {
-                    // create new document with client-side GUID
-                    data_map.insert(key_field.to_string(), Value::String(key.clone()));
-                    insert_meta(&mut data_map, DocumentKind::Entity, 1);
-                    let document = Value::Object(data_map);
-                    Ok(Some((
-                        TransactionOperation::CreateDocument {
-                            store: store.to_string(),
-                            kind: DocumentKind::Entity,
-                            data: document,
-                        },
-                        entity,
-                        committed_types,
-                    )))
-                } else {
-                    Err(PersistenceError::new(format!(
-                        "Entity {:?} has no cached key and no preassigned key",
-                        entity
-                    )))
-                }
-            };
+            }
+            if data_map.is_empty() {
+                return Ok(None);
+            }
+            if let Some(key) = session.cache.entity_keys.get(&entity) {
+                // update existing
+                let version_key = VersionKey::Entity(key.clone());
+                let current_version = session
+                    .cache
+                    .version_manager
+                    .get_version(&version_key)
+                    .ok_or_else(|| PersistenceError::new("Missing version for update"))?;
+                let next_version = current_version + 1;
+                insert_meta(&mut data_map, DocumentKind::Entity, next_version);
+                Ok(Some((
+                    TransactionOperation::UpdateDocument {
+                        store: store.to_string(),
+                        kind: DocumentKind::Entity,
+                        key: key.clone(),
+                        expected_current_version: current_version,
+                        patch: Value::Object(data_map),
+                    },
+                    entity,
+                    committed_types,
+                )))
+            } else if let Some(key) = preassigned_keys.get(&entity) {
+                // create new document with client-side GUID
+                data_map.insert(key_field.to_string(), Value::String(key.clone()));
+                insert_meta(&mut data_map, DocumentKind::Entity, 1);
+                let document = Value::Object(data_map);
+                Ok(Some((
+                    TransactionOperation::CreateDocument {
+                        store: store.to_string(),
+                        kind: DocumentKind::Entity,
+                        data: document,
+                    },
+                    entity,
+                    committed_types,
+                )))
+            } else {
+                Err(PersistenceError::new(format!(
+                    "Entity {:?} has no cached key and no preassigned key",
+                    entity
+                )))
+            }
+        };
 
         // 2) Creations & Updates (entities)
         let entity_ops_result: Result<Vec<_>, PersistenceError> = if let Some(pool) = thread_pool {
@@ -269,7 +265,8 @@ impl PersistenceSession {
         // 4) Relationship edge operations (diff-based)
         // Only run if there are registered relationships and dirty entities
         let has_relationships = !session.relationships.serializers.is_empty();
-        let has_dirty_rels = !dirty_relationship_entities.is_empty() || !despawned_entities.is_empty();
+        let has_dirty_rels =
+            !dirty_relationship_entities.is_empty() || !despawned_entities.is_empty();
         let mut new_edge_snapshot: HashSet<String> = session.cache.edge_snapshot.clone();
 
         if has_relationships && has_dirty_rels {
@@ -348,10 +345,7 @@ impl PersistenceSession {
             new_edge_snapshot = current_keys;
         }
 
-        debug!(
-            "[prepare_commit] Prepared {} operations.",
-            operations.len()
-        );
+        debug!("[prepare_commit] Prepared {} operations.", operations.len());
         Ok(CommitData {
             operations,
             new_entities: newly_created_entities,

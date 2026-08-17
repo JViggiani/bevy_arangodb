@@ -118,13 +118,33 @@ mod many_relationship_edges {
         ))
         .expect("query_edges failed");
 
-        assert_eq!(edges.len(), 2, "expected two outgoing Friendship edges from a");
+        assert_eq!(
+            edges.len(),
+            2,
+            "expected two outgoing Friendship edges from a"
+        );
 
-        let to_b = edges.iter().find(|e| e.to_guid == guid_b).expect("a→b edge missing");
-        let to_c = edges.iter().find(|e| e.to_guid == guid_c).expect("a→c edge missing");
+        let to_b = edges
+            .iter()
+            .find(|e| e.to_guid == guid_b)
+            .expect("a→b edge missing");
+        let to_c = edges
+            .iter()
+            .find(|e| e.to_guid == guid_c)
+            .expect("a→c edge missing");
 
-        let strength_b = to_b.payload.as_ref().and_then(|p| p.get("strength")).and_then(|v| v.as_f64()).unwrap();
-        let strength_c = to_c.payload.as_ref().and_then(|p| p.get("strength")).and_then(|v| v.as_f64()).unwrap();
+        let strength_b = to_b
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("strength"))
+            .and_then(|v| v.as_f64())
+            .unwrap();
+        let strength_c = to_c
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("strength"))
+            .and_then(|v| v.as_f64())
+            .unwrap();
         assert!((strength_b - 0.8).abs() < 1e-6);
         assert!((strength_c - 0.5).abs() < 1e-6);
 
@@ -299,7 +319,11 @@ mod many_relationship_edges {
         ))
         .expect("second query failed");
 
-        assert_eq!(edges_after.len(), 0, "edge should be removed after relationship removal");
+        assert_eq!(
+            edges_after.len(),
+            0,
+            "edge should be removed after relationship removal"
+        );
     }
 }
 
@@ -327,13 +351,25 @@ mod bevy_native {
 
         // Insert the relationship immediately — dirty tracking fires on the first update.
         // Both entities and the edge are committed together in a single call.
-        app.world_mut().entity_mut(source).insert(MemberOf { team: target });
+        app.world_mut()
+            .entity_mut(source)
+            .insert(MemberOf { team: target });
         app.update();
         commit_sync(&mut app, db.clone(), TEST_STORE).expect("commit failed");
 
         // Auto-assigned GUIDs are available after the commit completes.
-        let guid_source = app.world().get::<Guid>(source).expect("auto-guid for source").id().to_string();
-        let guid_target = app.world().get::<Guid>(target).expect("auto-guid for target").id().to_string();
+        let guid_source = app
+            .world()
+            .get::<Guid>(source)
+            .expect("auto-guid for source")
+            .id()
+            .to_string();
+        let guid_target = app
+            .world()
+            .get::<Guid>(target)
+            .expect("auto-guid for target")
+            .id()
+            .to_string();
 
         let edges = run_async(db.query_edges(&EdgeQuerySpecification {
             store: TEST_STORE.to_string(),
@@ -364,12 +400,24 @@ mod bevy_native {
         let target = app.world_mut().spawn(Health { value: 20 }).id();
 
         // Insert entities and relationship in a single commit.
-        app.world_mut().entity_mut(source).insert(MemberOf { team: target });
+        app.world_mut()
+            .entity_mut(source)
+            .insert(MemberOf { team: target });
         app.update();
         commit_sync(&mut app, db.clone(), TEST_STORE).expect("insert commit failed");
 
-        let guid_source = app.world().get::<Guid>(source).expect("auto-guid for source").id().to_string();
-        let guid_target = app.world().get::<Guid>(target).expect("auto-guid for target").id().to_string();
+        let guid_source = app
+            .world()
+            .get::<Guid>(source)
+            .expect("auto-guid for source")
+            .id()
+            .to_string();
+        let guid_target = app
+            .world()
+            .get::<Guid>(target)
+            .expect("auto-guid for target")
+            .id()
+            .to_string();
 
         // Verify edge exists.
         let edges = run_async(db.query_edges(&EdgeQuerySpecification {
@@ -429,7 +477,10 @@ mod bevy_native {
 
         let (db, _container) = setup();
         let mut app = setup_test_app(db.clone(), None);
-        app.add_systems(Update, establish_membership.run_if(resource_exists::<EntitiesReady>));
+        app.add_systems(
+            Update,
+            establish_membership.run_if(resource_exists::<EntitiesReady>),
+        );
 
         let source = app.world_mut().spawn((Health { value: 1 }, RelSource)).id();
         let target = app.world_mut().spawn((Health { value: 2 }, RelTarget)).id();
@@ -443,8 +494,18 @@ mod bevy_native {
         app.update();
         commit_sync(&mut app, db.clone(), TEST_STORE).expect("relationship commit failed");
 
-        let guid_source = app.world().get::<Guid>(source).expect("Guid for source").id().to_string();
-        let guid_target = app.world().get::<Guid>(target).expect("Guid for target").id().to_string();
+        let guid_source = app
+            .world()
+            .get::<Guid>(source)
+            .expect("Guid for source")
+            .id()
+            .to_string();
+        let guid_target = app
+            .world()
+            .get::<Guid>(target)
+            .expect("Guid for target")
+            .id()
+            .to_string();
 
         let edges = run_async(db.query_edges(&EdgeQuerySpecification {
             store: TEST_STORE.to_string(),
@@ -455,6 +516,11 @@ mod bevy_native {
         }))
         .expect("query_edges failed");
 
-        assert_eq!(edges.len(), 1, "edge should be persisted from system-Commands usage");
+        assert_eq!(
+            edges.len(),
+            1,
+            "edge should be persisted from system-Commands usage"
+        );
         assert_eq!(edges[0].relationship_type, "MemberOf");
-    }}
+    }
+}

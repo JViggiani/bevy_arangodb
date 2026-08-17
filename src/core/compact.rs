@@ -67,15 +67,15 @@ pub fn encode<T: Serialize>(value: &T) -> Result<String, CompactError> {
 
 /// Like [`encode`] with an explicit zstd level.
 pub fn encode_with_level<T: Serialize>(value: &T, zstd_level: i32) -> Result<String, CompactError> {
-    let raw = postcard::to_allocvec(value)
-        .map_err(|e| CompactError(format!("postcard encode: {e}")))?;
+    let raw =
+        postcard::to_allocvec(value).map_err(|e| CompactError(format!("postcard encode: {e}")))?;
     encode_postcard_bytes(&raw, zstd_level)
 }
 
 /// zstd + base64 for already-postcarded bytes (avoids a second postcard pass).
 pub fn encode_postcard_bytes(raw: &[u8], zstd_level: i32) -> Result<String, CompactError> {
-    let compressed = zstd::encode_all(raw, zstd_level)
-        .map_err(|e| CompactError(format!("zstd encode: {e}")))?;
+    let compressed =
+        zstd::encode_all(raw, zstd_level).map_err(|e| CompactError(format!("zstd encode: {e}")))?;
     Ok(BASE64.encode(compressed))
 }
 
@@ -120,8 +120,8 @@ pub fn to_persist_value<T: Serialize>(
     value: &T,
     threshold_bytes: usize,
 ) -> Result<Value, CompactError> {
-    let raw = postcard::to_allocvec(value)
-        .map_err(|e| CompactError(format!("postcard encode: {e}")))?;
+    let raw =
+        postcard::to_allocvec(value).map_err(|e| CompactError(format!("postcard encode: {e}")))?;
     if raw.len() > threshold_bytes {
         let payload = encode_postcard_bytes(&raw, DEFAULT_ZSTD_LEVEL)?;
         Ok(serde_json::json!({
@@ -285,7 +285,8 @@ mod tests {
         });
         let err = serde_json::from_value::<CompactJson<Sample>>(bad).unwrap_err();
         assert!(
-            err.to_string().contains("unsupported compact persist encoding"),
+            err.to_string()
+                .contains("unsupported compact persist encoding"),
             "unexpected error: {err}"
         );
     }

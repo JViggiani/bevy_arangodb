@@ -105,7 +105,9 @@ impl PersistenceSession {
     ///
     /// Unlike `register_component`, this does not require `T: Persist`.
     /// The `name` parameter is used as the collection/field key in the database.
-    pub fn register_component_named<T: Component + Serialize + DeserializeOwned + Send + Sync + 'static>(
+    pub fn register_component_named<
+        T: Component + Serialize + DeserializeOwned + Send + Sync + 'static,
+    >(
         &mut self,
         name: &'static str,
     ) {
@@ -156,7 +158,9 @@ impl PersistenceSession {
     ///
     /// Unlike `register_resource`, this does not require `R: Persist`.
     /// The `name` parameter is used as the key in the database.
-    pub fn register_resource_named<R: Resource + Serialize + DeserializeOwned + Send + Sync + 'static>(
+    pub fn register_resource_named<
+        R: Resource + Serialize + DeserializeOwned + Send + Sync + 'static,
+    >(
         &mut self,
         name: &'static str,
     ) {
@@ -231,35 +235,40 @@ impl PersistenceSession {
         self.register_relationship(
             type_id,
             name,
-            Box::new(move |world, session, preassigned: &HashMap<Entity, String>, scan_sources: &HashSet<Entity>| {
-                let mut edges = Vec::new();
-                for &from_entity in scan_sources {
-                    let Ok(entity_ref) = world.get_entity(from_entity) else {
-                        continue;
-                    };
-                    if let Some(rel) = entity_ref.get::<R>() {
-                        let target = rel.get();
-                        let from_guid = session
-                            .entity_key(from_entity)
-                            .cloned()
-                            .or_else(|| preassigned.get(&from_entity).cloned());
-                        let to_guid = session
-                            .entity_key(target)
-                            .cloned()
-                            .or_else(|| preassigned.get(&target).cloned());
-                        if let (Some(from_guid), Some(to_guid)) = (from_guid, to_guid) {
-                            edges.push(EdgeDocument {
-                                key: EdgeDocument::make_key(name, &from_guid, &to_guid),
-                                relationship_type: name.to_string(),
-                                from_guid,
-                                to_guid,
-                                payload: None,
-                            });
+            Box::new(
+                move |world,
+                      session,
+                      preassigned: &HashMap<Entity, String>,
+                      scan_sources: &HashSet<Entity>| {
+                    let mut edges = Vec::new();
+                    for &from_entity in scan_sources {
+                        let Ok(entity_ref) = world.get_entity(from_entity) else {
+                            continue;
+                        };
+                        if let Some(rel) = entity_ref.get::<R>() {
+                            let target = rel.get();
+                            let from_guid = session
+                                .entity_key(from_entity)
+                                .cloned()
+                                .or_else(|| preassigned.get(&from_entity).cloned());
+                            let to_guid = session
+                                .entity_key(target)
+                                .cloned()
+                                .or_else(|| preassigned.get(&target).cloned());
+                            if let (Some(from_guid), Some(to_guid)) = (from_guid, to_guid) {
+                                edges.push(EdgeDocument {
+                                    key: EdgeDocument::make_key(name, &from_guid, &to_guid),
+                                    relationship_type: name.to_string(),
+                                    from_guid,
+                                    to_guid,
+                                    payload: None,
+                                });
+                            }
                         }
                     }
-                }
-                Ok(edges)
-            }),
+                    Ok(edges)
+                },
+            ),
         );
     }
 
@@ -283,7 +292,9 @@ impl PersistenceSession {
             type_id,
             Box::new(|world, source_entity, targets| {
                 for (target, _payload) in targets {
-                    world.entity_mut(source_entity).insert(<R as From<Entity>>::from(target));
+                    world
+                        .entity_mut(source_entity)
+                        .insert(<R as From<Entity>>::from(target));
                 }
                 Ok(())
             }),
@@ -297,7 +308,9 @@ impl PersistenceSession {
     /// payload) to build `EdgeDocument`s. Only available when the
     /// `bevy_many_relationship_edges` feature is enabled.
     #[cfg(feature = "bevy_many_relationship_edges")]
-    pub fn register_many_relationship<R: serde::Serialize + DeserializeOwned + Send + Sync + 'static>(
+    pub fn register_many_relationship<
+        R: serde::Serialize + DeserializeOwned + Send + Sync + 'static,
+    >(
         &mut self,
         name: &'static str,
     ) {
@@ -306,51 +319,62 @@ impl PersistenceSession {
         self.register_relationship(
             type_id,
             name,
-            Box::new(move |world, session, preassigned: &HashMap<Entity, String>, scan_sources: &HashSet<Entity>| {
-                let mut edges = Vec::new();
-                for &from_entity in scan_sources {
-                    let Ok(entity_ref) = world.get_entity(from_entity) else {
-                        continue;
-                    };
-                    if let Some(outgoing) =
-                        entity_ref.get::<bevy_many_relationships::OutgoingRelationships<R>>()
-                    {
-                        let Some(from_guid) = session
-                            .entity_key(from_entity)
-                            .cloned()
-                            .or_else(|| preassigned.get(&from_entity).cloned())
-                        else {
+            Box::new(
+                move |world,
+                      session,
+                      preassigned: &HashMap<Entity, String>,
+                      scan_sources: &HashSet<Entity>| {
+                    let mut edges = Vec::new();
+                    for &from_entity in scan_sources {
+                        let Ok(entity_ref) = world.get_entity(from_entity) else {
                             continue;
                         };
-                        for (target, payload) in outgoing.iter() {
-                            let Some(to_guid) = session
-                                .entity_key(target)
+                        if let Some(outgoing) =
+                            entity_ref.get::<bevy_many_relationships::OutgoingRelationships<R>>()
+                        {
+                            let Some(from_guid) = session
+                                .entity_key(from_entity)
                                 .cloned()
-                                .or_else(|| preassigned.get(&target).cloned())
+                                .or_else(|| preassigned.get(&from_entity).cloned())
                             else {
                                 continue;
                             };
-                            let serialized_payload = serde_json::to_value(payload).ok();
-                            edges.push(EdgeDocument {
-                                key: EdgeDocument::make_key(name, &from_guid, &to_guid),
-                                relationship_type: name.to_string(),
-                                from_guid: from_guid.clone(),
-                                to_guid,
-                                payload: serialized_payload,
-                            });
+                            for (target, payload) in outgoing.iter() {
+                                let Some(to_guid) = session
+                                    .entity_key(target)
+                                    .cloned()
+                                    .or_else(|| preassigned.get(&target).cloned())
+                                else {
+                                    continue;
+                                };
+                                let serialized_payload = serde_json::to_value(payload).ok();
+                                edges.push(EdgeDocument {
+                                    key: EdgeDocument::make_key(name, &from_guid, &to_guid),
+                                    relationship_type: name.to_string(),
+                                    from_guid: from_guid.clone(),
+                                    to_guid,
+                                    payload: serialized_payload,
+                                });
+                            }
                         }
                     }
-                }
-                Ok(edges)
-            }),
+                    Ok(edges)
+                },
+            ),
         );
         self.relationships.deserializers.insert(
             type_id,
             Box::new(|world, source_entity, targets| {
-                if let Some(existing) = world.get::<bevy_many_relationships::OutgoingRelationships<R>>(source_entity) {
+                if let Some(existing) =
+                    world.get::<bevy_many_relationships::OutgoingRelationships<R>>(source_entity)
+                {
                     let existing_targets: Vec<Entity> = existing.targets().collect();
                     for target in existing_targets {
-                        bevy_many_relationships::remove_many_relationship::<R>(world, source_entity, target);
+                        bevy_many_relationships::remove_many_relationship::<R>(
+                            world,
+                            source_entity,
+                            target,
+                        );
                     }
                 }
 

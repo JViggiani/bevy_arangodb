@@ -1,9 +1,14 @@
 //! Commit functions for driving persistence to the database.
 
-use crate::bevy::plugins::persistence_plugin::{TokioRuntime, TriggerCommit, register_commit_listener};
+use crate::bevy::plugins::persistence_plugin::{
+    TokioRuntime, TriggerCommit, register_commit_listener,
+};
 use crate::core::db::connection::{DatabaseConnection, PersistenceError};
 use bevy::prelude::{App, info};
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 

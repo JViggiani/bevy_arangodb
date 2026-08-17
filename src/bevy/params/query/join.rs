@@ -6,9 +6,7 @@ use super::cache::CachePolicy;
 use super::persistence_query_system_param::PersistentQuery;
 use super::presence_spec::{FilterSupported, ToPresenceSpec, collect_presence_components};
 use super::query_data_to_components::QueryDataToComponents;
-use super::query_thread_local::{
-    take_filter, take_relationship_load_spec,
-};
+use super::query_thread_local::{take_filter, take_relationship_load_spec};
 
 impl<'w, 's, Q, F> PersistentQuery<'w, 's, Q, F>
 where

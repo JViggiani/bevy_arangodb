@@ -1,11 +1,11 @@
 use bevy::prelude::{App, MinimalPlugins};
 use bevy_persistence_database::apply_registered_persist_types;
 use bevy_persistence_database::bevy::plugins::persistence_plugin::PersistencePluginCore;
-#[cfg(feature = "postgres")]
-use bevy_persistence_database::core::db::PostgresDbConnection;
 use bevy_persistence_database::bevy::plugins::persistence_plugin::{
     PersistencePluginConfig, PersistencePlugins,
 };
+#[cfg(feature = "postgres")]
+use bevy_persistence_database::core::db::PostgresDbConnection;
 use bevy_persistence_database::core::db::{
     ArangoAuthMode, ArangoAuthRefresh, ArangoConnectionConfig, ArangoDbConnection,
     DatabaseConnection,
@@ -195,8 +195,10 @@ pub fn initialize_tests() {
         }
 
         if !tracing::dispatcher::has_been_set() {
-            let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("bevy_persistence_database=debug"));
+            let filter =
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("bevy_persistence_database=debug")
+                });
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_test_writer()
@@ -206,7 +208,10 @@ pub fn initialize_tests() {
 }
 
 /// Create a test `App` with `MinimalPlugins` and optional custom persistence configuration.
-pub fn setup_test_app(db: Arc<dyn DatabaseConnection>, config: Option<PersistencePluginConfig>) -> App {
+pub fn setup_test_app(
+    db: Arc<dyn DatabaseConnection>,
+    config: Option<PersistencePluginConfig>,
+) -> App {
     initialize_tests();
     let mut app = App::new();
     app.add_plugins(MinimalPlugins);

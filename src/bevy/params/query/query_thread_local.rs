@@ -30,11 +30,8 @@ impl RelationshipLoadSpec {
         self,
         registered: impl IntoIterator<Item = (TypeId, &'static str)>,
     ) -> HashMap<TypeId, usize> {
-        let mut result: HashMap<TypeId, usize> = self
-            .per_type
-            .into_iter()
-            .filter(|(_, d)| *d > 0)
-            .collect();
+        let mut result: HashMap<TypeId, usize> =
+            self.per_type.into_iter().filter(|(_, d)| *d > 0).collect();
         if let Some(all_depth) = self.all {
             if all_depth > 0 {
                 for (type_id, _) in registered {

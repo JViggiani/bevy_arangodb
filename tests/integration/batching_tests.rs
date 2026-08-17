@@ -189,14 +189,12 @@ fn test_atomic_commit_failure_rolls_back_all() {
     let mut db = MockDatabaseConnection::new();
     db.expect_document_key_field().return_const("_key");
 
-    db.expect_execute_transaction()
-        .times(1)
-        .returning(|_| {
-            Box::pin(async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                Err(PersistenceError::new("Simulated failure in transaction"))
-            })
-        });
+    db.expect_execute_transaction().times(1).returning(|_| {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Err(PersistenceError::new("Simulated failure in transaction"))
+        })
+    });
 
     let db_arc = Arc::new(db);
     let config = PersistencePluginConfig {

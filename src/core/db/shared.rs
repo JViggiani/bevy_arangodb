@@ -1,6 +1,8 @@
 //! Shared utilities for database connection implementations
 
-use crate::core::db::connection::{DocumentKind, EdgeDocument, PersistenceError, TransactionOperation};
+use crate::core::db::connection::{
+    DocumentKind, EdgeDocument, PersistenceError, TransactionOperation,
+};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::RwLock;

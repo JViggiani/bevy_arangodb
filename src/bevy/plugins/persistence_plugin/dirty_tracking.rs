@@ -180,7 +180,8 @@ mod tests {
 
         app.add_systems(
             PostUpdate,
-            auto_dirty_tracking_entity_system::<TestHealth>.in_set(PersistenceSystemSet::TrackChanges),
+            auto_dirty_tracking_entity_system::<TestHealth>
+                .in_set(PersistenceSystemSet::TrackChanges),
         );
         app.add_systems(
             PostUpdate,
@@ -188,16 +189,12 @@ mod tests {
         );
 
         let entity = app.world_mut().spawn_empty().id();
-        app.world_mut().resource_scope(|world, mut session: Mut<PersistenceSession>| {
-            session
-                .hydrate_entity_component(
-                    world,
-                    entity,
-                    "TestHealth",
-                    json!({ "value": 1 }),
-                )
-                .expect("hydrate should succeed");
-        });
+        app.world_mut()
+            .resource_scope(|world, mut session: Mut<PersistenceSession>| {
+                session
+                    .hydrate_entity_component(world, entity, "TestHealth", json!({ "value": 1 }))
+                    .expect("hydrate should succeed");
+            });
 
         app.update();
 
@@ -221,10 +218,7 @@ mod tests {
         session.register_component_named::<TestHealth>("TestHealth");
         app.insert_resource(session);
 
-        app.add_systems(
-            Update,
-            auto_dirty_tracking_entity_system::<TestHealth>,
-        );
+        app.add_systems(Update, auto_dirty_tracking_entity_system::<TestHealth>);
 
         let entity = app.world_mut().spawn_empty().id();
         app.world_mut()

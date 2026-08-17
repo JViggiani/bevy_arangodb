@@ -29,13 +29,12 @@ use std::sync::{Arc, RwLock};
 
 // Local helper to pull out the version field
 fn extract_version(doc: &Value, key: &str) -> Result<u64, PersistenceError> {
-    read_version(doc)
-        .ok_or_else(|| {
-            PersistenceError::new(format!(
-                "Document '{}' is missing version field '{}'",
-                key, BEVY_PERSISTENCE_DATABASE_VERSION_FIELD
-            ))
-        })
+    read_version(doc).ok_or_else(|| {
+        PersistenceError::new(format!(
+            "Document '{}' is missing version field '{}'",
+            key, BEVY_PERSISTENCE_DATABASE_VERSION_FIELD
+        ))
+    })
 }
 
 // Local constants and enums to avoid magic strings
@@ -450,12 +449,7 @@ impl ArangoDbConnection {
         } else {
             format!(
                 "FOR doc IN @@{}\n  {}\n  RETURN MERGE({{ \"{}\": doc.`{}` }}, {{ \"{}\": doc.`{}` }})",
-                AQL_BIND_STORE,
-                filter,
-                key_field,
-                key_field,
-                meta,
-                meta
+                AQL_BIND_STORE, filter, key_field, key_field, meta, meta
             )
         }
     }
@@ -500,9 +494,8 @@ impl ArangoDbConnection {
                     .map_err(|e| PersistenceError::new(e.to_string()))?;
                 match col.document::<Value>(&key).await {
                     Ok(doc) => {
-                        let matches_kind = read_kind(&doc.document)
-                            .map(|k| k == kind)
-                            .unwrap_or(false);
+                        let matches_kind =
+                            read_kind(&doc.document).map(|k| k == kind).unwrap_or(false);
                         if !matches_kind {
                             return Ok(None);
                         }

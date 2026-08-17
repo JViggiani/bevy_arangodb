@@ -1,10 +1,9 @@
+use bevy_persistence_database::core::db::TransactionOperation;
 /// Tests for the raw database-layer edge operations: writing, upserting, deleting,
 /// and querying edge documents directly via `TransactionOperation` and `query_edges`.
 /// These tests bypass Bevy ECS and the persistence plugin entirely — they verify that
 /// the DB adapter correctly handles edge collections at the storage layer.
-
 use bevy_persistence_database::core::db::connection::EdgeDocument;
-use bevy_persistence_database::core::db::TransactionOperation;
 use bevy_persistence_database::core::query::EdgeQuerySpecification;
 
 use crate::common::*;
@@ -35,25 +34,35 @@ fn test_edge_upsert_and_delete_in_transaction() {
     ];
 
     // Upsert
-    let result = run_async(db.execute_transaction(vec![TransactionOperation::UpsertEdges {
-        store: TEST_STORE.to_string(),
-        edges: edges.clone(),
-    }]));
+    let result = run_async(
+        db.execute_transaction(vec![TransactionOperation::UpsertEdges {
+            store: TEST_STORE.to_string(),
+            edges: edges.clone(),
+        }]),
+    );
     assert!(result.is_ok(), "edge upsert failed: {:?}", result.err());
 
     // Upsert again — must be idempotent
-    let result2 = run_async(db.execute_transaction(vec![TransactionOperation::UpsertEdges {
-        store: TEST_STORE.to_string(),
-        edges,
-    }]));
-    assert!(result2.is_ok(), "idempotent edge upsert failed: {:?}", result2.err());
+    let result2 = run_async(
+        db.execute_transaction(vec![TransactionOperation::UpsertEdges {
+            store: TEST_STORE.to_string(),
+            edges,
+        }]),
+    );
+    assert!(
+        result2.is_ok(),
+        "idempotent edge upsert failed: {:?}",
+        result2.err()
+    );
 
     // Delete one edge by key
     let delete_key = EdgeDocument::make_key("TestRel", "guid_a", "guid_b");
-    let result3 = run_async(db.execute_transaction(vec![TransactionOperation::DeleteEdges {
-        store: TEST_STORE.to_string(),
-        keys: vec![delete_key],
-    }]));
+    let result3 = run_async(
+        db.execute_transaction(vec![TransactionOperation::DeleteEdges {
+            store: TEST_STORE.to_string(),
+            keys: vec![delete_key],
+        }]),
+    );
     assert!(result3.is_ok(), "edge delete failed: {:?}", result3.err());
 }
 
@@ -87,10 +96,12 @@ fn test_query_edges_filters_by_type_and_source() {
         },
     ];
 
-    run_async(db.execute_transaction(vec![TransactionOperation::UpsertEdges {
-        store: TEST_STORE.to_string(),
-        edges,
-    }]))
+    run_async(
+        db.execute_transaction(vec![TransactionOperation::UpsertEdges {
+            store: TEST_STORE.to_string(),
+            edges,
+        }]),
+    )
     .expect("edge upsert failed");
 
     let result = run_async(db.query_edges(&EdgeQuerySpecification {
@@ -103,9 +114,11 @@ fn test_query_edges_filters_by_type_and_source() {
     .expect("query_edges failed");
 
     assert_eq!(result.len(), 2);
-    assert!(result
-        .iter()
-        .all(|edge| edge.relationship_type == "Friendship"));
+    assert!(
+        result
+            .iter()
+            .all(|edge| edge.relationship_type == "Friendship")
+    );
 }
 
 /// `query_edges` with `depth > 1` traverses multi-hop relationship chains and
@@ -138,10 +151,12 @@ fn test_query_edges_depth_traversal() {
         },
     ];
 
-    run_async(db.execute_transaction(vec![TransactionOperation::UpsertEdges {
-        store: TEST_STORE.to_string(),
-        edges,
-    }]))
+    run_async(
+        db.execute_transaction(vec![TransactionOperation::UpsertEdges {
+            store: TEST_STORE.to_string(),
+            edges,
+        }]),
+    )
     .expect("edge upsert failed");
 
     let depth_2 = run_async(db.query_edges(&EdgeQuerySpecification {

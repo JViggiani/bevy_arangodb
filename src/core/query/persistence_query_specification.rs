@@ -1,5 +1,5 @@
-use crate::core::db::connection::DocumentKind;
 use super::filter_expression::FilterExpression;
+use crate::core::db::connection::DocumentKind;
 
 /// Pagination configuration for database queries.
 #[derive(Debug, Clone)]

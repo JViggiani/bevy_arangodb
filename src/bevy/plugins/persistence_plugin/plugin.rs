@@ -17,7 +17,8 @@ use crate::{
 
 use super::{
     commit::{
-        CommitCompleted, CommitStatus, TriggerCommit, handle_commit_completed, handle_commit_trigger,
+        CommitCompleted, CommitStatus, TriggerCommit, handle_commit_completed,
+        handle_commit_trigger,
     },
     despawn_tracking::{auto_despawn_tracking_resource_system, auto_despawn_tracking_system},
     ecs_plumbing::{
@@ -122,8 +123,7 @@ impl Plugin for PersistencePluginCore {
         }
 
         app.insert_resource(
-            PersistenceSession::new()
-                .with_compact_threshold(self.config.compact_threshold_bytes),
+            PersistenceSession::new().with_compact_threshold(self.config.compact_threshold_bytes),
         );
         app.insert_resource(self.config.clone());
         app.insert_resource(DatabaseConnectionResource {
@@ -161,10 +161,7 @@ impl Plugin for PersistencePluginCore {
         app.add_systems(
             PostUpdate,
             (
-                (
-                    apply_deferred_world_ops,
-                    publish_immediate_world_ptr,
-                )
+                (apply_deferred_world_ops, publish_immediate_world_ptr)
                     .in_set(PersistenceSystemSet::LoadApply),
                 (
                     auto_despawn_tracking_system,

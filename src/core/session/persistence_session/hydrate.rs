@@ -235,12 +235,7 @@ impl PersistenceSession {
         store: &str,
         world: &mut World,
     ) -> Result<(), PersistenceError> {
-        let res_names: Vec<String> = self
-            .resources
-            .deserializers
-            .keys()
-            .cloned()
-            .collect();
+        let res_names: Vec<String> = self.resources.deserializers.keys().cloned().collect();
         self.ensure_hydrating();
         for res_name in res_names {
             self.materialize_resource(db, store, world, &res_name)

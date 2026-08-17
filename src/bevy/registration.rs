@@ -55,11 +55,11 @@ where
         + Sync
         + 'static,
 {
-    use ::bevy::prelude::IntoScheduleConfigs;
     use crate::bevy::plugins::persistence_plugin::{
-        RegisteredPersistTypes, PersistenceSystemSet, auto_dirty_tracking_entity_system,
+        PersistenceSystemSet, RegisteredPersistTypes, auto_dirty_tracking_entity_system,
     };
     use crate::core::session::PersistenceSession;
+    use ::bevy::prelude::IntoScheduleConfigs;
     use std::any::TypeId;
 
     let type_id = TypeId::of::<T>();
@@ -75,8 +75,7 @@ where
             .register_component_named::<T>(name);
         app.add_systems(
             ::bevy::app::PostUpdate,
-            auto_dirty_tracking_entity_system::<T>
-                .in_set(PersistenceSystemSet::TrackChanges),
+            auto_dirty_tracking_entity_system::<T>.in_set(PersistenceSystemSet::TrackChanges),
         );
     }
 }
@@ -96,11 +95,11 @@ where
         + Sync
         + 'static,
 {
-    use ::bevy::prelude::IntoScheduleConfigs;
     use crate::bevy::plugins::persistence_plugin::{
-        RegisteredPersistTypes, PersistenceSystemSet, auto_dirty_tracking_resource_system,
+        PersistenceSystemSet, RegisteredPersistTypes, auto_dirty_tracking_resource_system,
     };
     use crate::core::session::PersistenceSession;
+    use ::bevy::prelude::IntoScheduleConfigs;
     use std::any::TypeId;
 
     let type_id = TypeId::of::<R>();
@@ -116,8 +115,7 @@ where
             .register_resource_named::<R>(name);
         app.add_systems(
             ::bevy::app::PostUpdate,
-            auto_dirty_tracking_resource_system::<R>
-                .in_set(PersistenceSystemSet::TrackChanges),
+            auto_dirty_tracking_resource_system::<R>.in_set(PersistenceSystemSet::TrackChanges),
         );
     }
 }
@@ -136,17 +134,13 @@ where
 #[cfg(not(feature = "bevy_many_relationship_edges"))]
 pub fn register_persist_bevy_relationship<R>(app: &mut App)
 where
-    R: ::bevy::prelude::Component
-        + ::bevy::ecs::relationship::Relationship
-        + Send
-        + Sync
-        + 'static,
+    R: ::bevy::prelude::Component + ::bevy::ecs::relationship::Relationship + Send + Sync + 'static,
 {
-    use ::bevy::prelude::IntoScheduleConfigs;
     use crate::bevy::plugins::persistence_plugin::{
-        RegisteredPersistTypes, PersistenceSystemSet, auto_dirty_tracking_bevy_relationship_system,
+        PersistenceSystemSet, RegisteredPersistTypes, auto_dirty_tracking_bevy_relationship_system,
     };
     use crate::core::session::PersistenceSession;
+    use ::bevy::prelude::IntoScheduleConfigs;
     use std::any::TypeId;
 
     let type_id = TypeId::of::<R>();
@@ -179,11 +173,11 @@ pub fn register_persist_many_relationship<R>(app: &mut App)
 where
     R: ::serde::Serialize + ::serde::de::DeserializeOwned + Send + Sync + 'static,
 {
-    use ::bevy::prelude::IntoScheduleConfigs;
     use crate::bevy::plugins::persistence_plugin::{
-        RegisteredPersistTypes, PersistenceSystemSet, auto_dirty_tracking_relationship_system,
+        PersistenceSystemSet, RegisteredPersistTypes, auto_dirty_tracking_relationship_system,
     };
     use crate::core::session::PersistenceSession;
+    use ::bevy::prelude::IntoScheduleConfigs;
     use std::any::TypeId;
 
     let type_id = TypeId::of::<R>();
@@ -198,8 +192,7 @@ where
             .register_many_relationship::<R>(collection_name::<R>());
         app.add_systems(
             ::bevy::app::PostUpdate,
-            auto_dirty_tracking_relationship_system::<R>
-                .in_set(PersistenceSystemSet::TrackChanges),
+            auto_dirty_tracking_relationship_system::<R>.in_set(PersistenceSystemSet::TrackChanges),
         );
     }
 }

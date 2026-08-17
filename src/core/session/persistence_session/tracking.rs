@@ -135,7 +135,9 @@ impl PersistenceSession {
             despawned_entities: std::mem::take(&mut self.tracking.despawned_entities),
             dirty_resources: std::mem::take(&mut self.tracking.dirty_resources),
             despawned_resources: std::mem::take(&mut self.tracking.despawned_resources),
-            dirty_relationship_entities: std::mem::take(&mut self.tracking.dirty_relationship_entities),
+            dirty_relationship_entities: std::mem::take(
+                &mut self.tracking.dirty_relationship_entities,
+            ),
         }
     }
 

@@ -454,7 +454,11 @@ fn test_preexisting_guid_is_preserved() {
         .world()
         .get::<Guid>(entity)
         .expect("entity should still have a Guid after commit");
-    assert_eq!(guid.id(), custom_guid, "pre-existing GUID should be preserved");
+    assert_eq!(
+        guid.id(),
+        custom_guid,
+        "pre-existing GUID should be preserved"
+    );
 
     // Verify the document exists in DB under the custom key
     let health_json = run_async(db.fetch_component(TEST_STORE, custom_guid, Health::name()))

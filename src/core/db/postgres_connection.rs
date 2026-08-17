@@ -14,12 +14,12 @@ use crate::core::query::{
     BinaryOperator, EdgeQuerySpecification, FilterExpression, PersistenceQuerySpecification,
 };
 use bevy::log::{debug, error, info};
+use deadpool_postgres::{Config as PoolConfig, Pool, Runtime};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde_json::Value;
 use std::fmt;
 use std::sync::Arc;
-use deadpool_postgres::{Config as PoolConfig, Pool, Runtime};
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Config, NoTls};
 
@@ -210,7 +210,11 @@ impl PostgresDbConnection {
 
         // constrain bevy_type to the requested document kind
         params.push(SqlParam::Text(spec.kind.as_str().to_string()));
-        clauses.push(format!("({} = ${})", BEVY_PERSISTENCE_DATABASE_BEVY_TYPE_FIELD, params.len()));
+        clauses.push(format!(
+            "({} = ${})",
+            BEVY_PERSISTENCE_DATABASE_BEVY_TYPE_FIELD,
+            params.len()
+        ));
 
         // presence_with: ensure component exists (use jsonb existence operator)
         if !spec.presence_with.is_empty() {

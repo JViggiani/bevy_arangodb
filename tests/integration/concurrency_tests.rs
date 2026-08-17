@@ -1,11 +1,11 @@
 use bevy_persistence_database::bevy::components::Guid;
 use bevy_persistence_database::bevy::params::query::PersistentQuery;
+use bevy_persistence_database::bevy::query::PersistenceQuery;
 use bevy_persistence_database::core::db::{
     BEVY_PERSISTENCE_DATABASE_METADATA_FIELD, BEVY_PERSISTENCE_DATABASE_VERSION_FIELD,
     DocumentKind, PersistenceError, TransactionOperation,
 };
 use bevy_persistence_database::core::persist::Persist;
-use bevy_persistence_database::bevy::query::PersistenceQuery;
 use bevy_persistence_database::core::session::commit_sync;
 use serde_json::json;
 
